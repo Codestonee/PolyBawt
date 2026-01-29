@@ -1,0 +1,90 @@
+# Polymarket Bot - Example Configuration
+# Copy to local.yaml or production.yaml and customize
+
+environment: example  # local, paper, production
+
+# API Endpoints
+api:
+  clob_base_url: "https://clob.polymarket.com"
+  gamma_base_url: "https://gamma-api.polymarket.com"
+  ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+  polygon_chain_id: 137
+
+# Trading Parameters
+trading:
+  # Assets to trade (BTC, ETH, SOL, XRP)
+  assets:
+    - BTC
+    - ETH
+    - SOL
+    - XRP
+  
+  # Minimum net edge to trade (after fees)
+  min_edge_threshold: 0.04  # 4%
+  
+  # Position sizing
+  kelly_fraction: 0.25  # 1/4 Kelly
+  max_position_pct: 0.02  # 2% of portfolio per trade
+  max_asset_exposure_pct: 0.05  # 5% per asset
+  
+  # Timing
+  cutoff_seconds: 60  # Stop trading X seconds before expiry
+  min_seconds_after_open: 30  # Avoid first 30s volatility
+
+# Risk Management
+risk:
+  # Daily limits
+  daily_loss_soft_limit_pct: 0.03  # Pause new entries
+  daily_loss_hard_limit_pct: 0.05  # Close all, halt
+  
+  # Drawdown
+  max_drawdown_pct: 0.10  # Kill switch
+  
+  # Volatility
+  volatility_pause_threshold: 2.0  # 200% annualized
+  
+  # Correlation
+  correlation_reduction_threshold: 0.8
+
+# Execution
+execution:
+  # Rate limiting (stay 10% under actual limits)
+  rate_limit_buffer_pct: 0.10
+  
+  # WebSocket
+  ws_reconnect_initial_ms: 100
+  ws_reconnect_max_ms: 5000
+  ws_reconnect_multiplier: 2.0
+  ws_reconnect_jitter: 0.2
+  
+  # Orders
+  order_timeout_ms: 5000
+  max_retries: 3
+
+# Model Parameters
+models:
+  # Jump-Diffusion
+  jump_intensity_per_day: 2.0
+  jump_size_std: 0.02
+  
+  # Volatility defaults (annualized)
+  default_volatility:
+    BTC: 0.60
+    ETH: 0.70
+    SOL: 0.85
+    XRP: 0.90
+
+# Observability
+observability:
+  # Logging
+  log_level: INFO
+  log_format: json  # json or text
+  
+  # Metrics
+  metrics_port: 9090
+  
+  # Alerts
+  telegram_enabled: false
+
+# Dry Run (Paper Trading)
+dry_run: true
