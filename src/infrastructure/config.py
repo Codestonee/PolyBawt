@@ -29,6 +29,7 @@ class TradingConfig(BaseModel):
     """Trading parameters."""
     
     assets: list[str] = Field(default_factory=lambda: ["BTC", "ETH", "SOL", "XRP"])
+    bankroll: float = 50.0  # Starting capital in USD
     min_edge_threshold: float = 0.04  # 4% after fees
     kelly_fraction: float = 0.25  # 1/4 Kelly
     max_position_pct: float = 0.02  # 2% per trade
@@ -126,24 +127,56 @@ class SecretsConfig(BaseSettings):
 
 class AppConfig(BaseModel):
     """Complete application configuration."""
-    
+
+    # Configuration versioning
+    config_version: str = "1.1.0"
+    config_schema_version: int = 2
+
     environment: str = "local"
     dry_run: bool = True
-    
+
     api: APIConfig = Field(default_factory=APIConfig)
     trading: TradingConfig = Field(default_factory=TradingConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     models: ModelsConfig = Field(default_factory=ModelsConfig)
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
-    
+
     @property
     def is_production(self) -> bool:
         return self.environment == "production"
-    
+
     @property
     def is_paper(self) -> bool:
         return self.dry_run or self.environment == "paper"
+
+    def diff_from_defaults(self) -> dict[str, Any]:
+        """
+        Get configuration differences from defaults.
+
+        Useful for logging what's been customized.
+        """
+        defaults = AppConfig()
+        current = self.model_dump()
+        default_dict = defaults.model_dump()
+
+        def diff_dict(d1: dict, d2: dict, path: str = "") -> dict:
+            differences = {}
+            for key in set(d1.keys()) | set(d2.keys()):
+                full_key = f"{path}.{key}" if path else key
+                v1 = d1.get(key)
+                v2 = d2.get(key)
+
+                if isinstance(v1, dict) and isinstance(v2, dict):
+                    nested = diff_dict(v1, v2, full_key)
+                    if nested:
+                        differences.update(nested)
+                elif v1 != v2:
+                    differences[full_key] = {"current": v1, "default": v2}
+
+            return differences
+
+        return diff_dict(current, default_dict)
 
 
 def load_yaml_config(path: Path) -> dict[str, Any]:

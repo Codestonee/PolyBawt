@@ -6,6 +6,10 @@ Usage:
     python -m src.main --config config/production.yaml --live
 """
 
+# Load .env FIRST before any other imports
+from dotenv import load_dotenv
+load_dotenv()
+
 import argparse
 import asyncio
 import signal
@@ -19,8 +23,10 @@ from src.ingestion.market_discovery import MarketDiscovery
 from src.ingestion.oracle_feed import OracleFeed
 from src.execution.order_manager import OrderManager
 from src.execution.rate_limiter import RateLimiter
+from src.execution.clob_client import CLOBClient
 from src.risk.circuit_breaker import CircuitBreaker
 from src.strategy.value_betting import ValueBettingStrategy
+from src.portfolio.tracker import Portfolio
 
 
 async def run_strategy(config: AppConfig) -> None:
@@ -37,10 +43,51 @@ async def run_strategy(config: AppConfig) -> None:
     market_discovery = MarketDiscovery(base_url=config.api.gamma_base_url)
     oracle = OracleFeed()
     rate_limiter = RateLimiter()
-    
-    order_manager = OrderManager(dry_run=config.dry_run)
-    circuit_breaker = CircuitBreaker(starting_capital=100)  # TODO: Make configurable
-    
+
+    # FIX #3: Initialize CLOB client for order book pricing AND order execution
+    clob_client = CLOBClient(
+        dry_run=config.dry_run,
+        rate_limiter=rate_limiter,
+    )
+    await clob_client.initialize()
+
+    # Create submit callback that uses CLOBClient for live orders
+    async def submit_order_callback(order):
+        """Submit order to exchange via CLOB client."""
+        from src.execution.order_manager import OrderState
+        response = await clob_client.place_order(
+            token_id=order.token_id,
+            side=order.side.value,
+            price=order.price,
+            size=order.size,
+            client_order_id=order.client_order_id,
+        )
+        if response.success:
+            order.exchange_order_id = response.exchange_order_id
+            order.update_state(OrderState.NEW)
+            logger.info("Order submitted to exchange", 
+                       exchange_order_id=response.exchange_order_id,
+                       client_order_id=order.client_order_id)
+        else:
+            order.update_state(OrderState.REJECTED)
+            logger.error("Order rejected by exchange",
+                        error_code=response.error_code,
+                        error_message=response.error_message)
+
+    order_manager = OrderManager(
+        dry_run=config.dry_run, 
+        rate_limiter=rate_limiter,
+        submit_callback=submit_order_callback if not config.dry_run else None,
+    )
+
+    # FIX #4: Initialize Portfolio for fill-based tracking
+    bankroll = config.trading.bankroll  # Now configurable from YAML
+
+    # Circuit breaker MUST use same starting capital as Portfolio!
+    circuit_breaker = CircuitBreaker(starting_capital=bankroll)
+
+    portfolio = Portfolio(starting_capital=bankroll)
+
     # Create strategy
     strategy = ValueBettingStrategy(
         config=config,
@@ -49,7 +96,9 @@ async def run_strategy(config: AppConfig) -> None:
         order_manager=order_manager,
         rate_limiter=rate_limiter,
         circuit_breaker=circuit_breaker,
-        bankroll=100,  # TODO: Make configurable
+        clob_client=clob_client,  # FIX #3: Pass CLOB client for order books
+        portfolio=portfolio,  # FIX #4: Pass Portfolio for fill-based tracking
+        bankroll=bankroll,
     )
     
     # Set up shutdown handler

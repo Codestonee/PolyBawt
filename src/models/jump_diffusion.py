@@ -32,6 +32,107 @@ def norm_pdf(x: float) -> float:
     return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
 
 
+# ============================================================================
+# Logit Transform Utilities (arXiv:2510.15205 Section 3.2)
+# 
+# The paper recommends working in log-odds (logit) space for:
+# - Stable volatility across the probability range
+# - No boundary issues at p=0 and p=1
+# - More accurate edge calculations near extremes
+# ============================================================================
+
+def logit(p: float) -> float:
+    """
+    Transform probability to log-odds.
+    
+    x = log(p / (1-p))
+    
+    Maps (0,1) -> (-∞,+∞)
+    """
+    # Clamp to avoid log(0) or log(inf)
+    p = max(0.001, min(0.999, p))
+    return math.log(p / (1 - p))
+
+
+def inv_logit(x: float) -> float:
+    """
+    Transform log-odds back to probability (sigmoid function).
+    
+    p = 1 / (1 + exp(-x))
+    
+    Maps (-∞,+∞) -> (0,1)
+    """
+    # Numerically stable sigmoid
+    if x >= 0:
+        return 1 / (1 + math.exp(-x))
+    else:
+        exp_x = math.exp(x)
+        return exp_x / (1 + exp_x)
+
+
+def logit_volatility(prob: float, price_volatility: float) -> float:
+    """
+    Convert price/probability volatility to logit volatility.
+    
+    From the paper (Section 3.1):
+    σ_x = σ_p / S'(x) = σ_p / (p * (1-p))
+    
+    where S'(x) is the derivative of sigmoid = p(1-p)
+    
+    Args:
+        prob: Current probability (0-1)
+        price_volatility: Volatility in probability space
+    
+    Returns:
+        Volatility in logit space
+    """
+    # Jacobian of logit transform: d(logit(p))/dp = 1/(p(1-p))
+    jacobian = prob * (1 - prob)
+    
+    # Avoid extreme values near boundaries
+    if jacobian < 0.01:
+        jacobian = 0.01
+    
+    return price_volatility / jacobian
+
+
+def prob_volatility(logit_val: float, logit_vol: float) -> float:
+    """
+    Convert logit volatility back to probability volatility.
+    
+    σ_p = σ_x * S'(x) = σ_x * p * (1-p)
+    
+    Args:
+        logit_val: Current log-odds value
+        logit_vol: Volatility in logit space
+    
+    Returns:
+        Volatility in probability space
+    """
+    prob = inv_logit(logit_val)
+    jacobian = prob * (1 - prob)
+    return logit_vol * jacobian
+
+
+def edge_in_logit_space(model_prob: float, market_prob: float) -> float:
+    """
+    Calculate edge in logit space (more stable than probability space).
+    
+    near p=0.5: logit space ≈ probability space
+    near p=0 or p=1: logit space provides more stable calculations
+    
+    Args:
+        model_prob: Our model's probability estimate
+        market_prob: Market's implied probability
+    
+    Returns:
+        Edge in logit units (positive = model thinks higher probability)
+    """
+    model_logit = logit(model_prob)
+    market_logit = logit(market_prob)
+    return model_logit - market_logit
+
+
 @lru_cache(maxsize=20)
 def factorial(n: int) -> int:
     """Cached factorial computation."""

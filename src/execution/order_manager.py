@@ -17,6 +17,7 @@ from enum import Enum
 from typing import Any, Callable, Coroutine
 
 from src.infrastructure.logging import get_logger
+from src.execution.rate_limiter import RateLimiter
 
 logger = get_logger(__name__)
 
@@ -127,6 +128,7 @@ class Order:
         """Update state with timestamp."""
         self.state = new_state
         self.updated_at = time.time()
+        # Note: Persistence happens in OrderManager, not here
     
     def add_fill(self, fill_size: float, fill_price: float) -> None:
         """Record a fill."""
@@ -155,23 +157,41 @@ def generate_client_order_id(
     strategy_id: str,
     token_id: str,
     nonce: str | None = None,
+    deterministic: bool = False,
+    price: float | None = None,
+    side: str | None = None,
 ) -> str:
     """
     Generate idempotent client order ID.
-    
-    Format: {strategy_id}_{token_id_prefix}_{timestamp_ms}_{nonce}
-    
-    This ensures:
-    - Uniqueness across strategies
-    - Traceability to token
-    - Timestamp for debugging
-    - Random component for safety
+
+    Format (random): {strategy_id}_{token_id_prefix}_{timestamp_ms}_{nonce}
+    Format (deterministic): {strategy_id}_{token_id_prefix}_{price_int}_{side}
+
+    Args:
+        strategy_id: Strategy identifier
+        token_id: Token being traded
+        nonce: Optional nonce (random if None)
+        deterministic: If True, use price+side instead of timestamp+nonce
+        price: Price for deterministic mode
+        side: Side for deterministic mode (BUY/SELL)
+
+    Returns:
+        Client order ID string
     """
-    timestamp_ms = int(time.time() * 1000)
     token_prefix = token_id[:8] if len(token_id) >= 8 else token_id
-    nonce = nonce or uuid.uuid4().hex[:6]
-    
-    return f"{strategy_id}_{token_prefix}_{timestamp_ms}_{nonce}"
+
+    if deterministic:
+        # FIX #8: Deterministic IDs for crash recovery
+        # Use price and side as the nonce component
+        if price is None or side is None:
+            raise ValueError("price and side required for deterministic IDs")
+        price_int = int(price * 10000)  # Convert to basis points
+        return f"{strategy_id}_{token_prefix}_{price_int}_{side}"
+    else:
+        # Random mode (backward compatible)
+        timestamp_ms = int(time.time() * 1000)
+        nonce = nonce or uuid.uuid4().hex[:6]
+        return f"{strategy_id}_{token_prefix}_{timestamp_ms}_{nonce}"
 
 
 OrderCallback = Callable[[Order], Coroutine[Any, Any, None]]
@@ -208,10 +228,20 @@ class OrderManager:
         dry_run: bool = True,
         submit_callback: OrderCallback | None = None,
         cancel_callback: OrderCallback | None = None,
+        persistence_file: str | None = None,  # FIX #8: Optional persistence
+        rate_limiter: RateLimiter | None = None,  # FIX #6: Rate limiter enforcement
     ):
         self.dry_run = dry_run
         self._submit_callback = submit_callback
         self._cancel_callback = cancel_callback
+        self._rate_limiter = rate_limiter  # FIX #6: Store for use in submit/cancel
+
+        # FIX #8: Order state persistence for crash recovery
+        self._persistence: "OrderStateStore | None" = None
+        if persistence_file:
+            from src.execution.order_persistence import OrderStateStore
+            self._persistence = OrderStateStore(persistence_file)
+            logger.info("Order persistence enabled", file=persistence_file)
         
         # Order tracking
         self._orders: dict[str, Order] = {}
@@ -276,11 +306,15 @@ class OrderManager:
         
         # Track order
         self._orders[client_order_id] = order
-        
+
         if token_id not in self._orders_by_token:
             self._orders_by_token[token_id] = []
         self._orders_by_token[token_id].append(client_order_id)
-        
+
+        # FIX #8: Persist order state
+        if self._persistence:
+            self._persistence.save_order(order)
+
         logger.debug(
             "Order created",
             client_order_id=client_order_id,
@@ -289,7 +323,7 @@ class OrderManager:
             price=price,
             size=size,
         )
-        
+
         return order
     
     async def submit_order(self, order: Order) -> bool:
@@ -312,11 +346,25 @@ class OrderManager:
             )
             return False
         
+        # FIX #6: Enforce rate limit before submission
+        if self._rate_limiter:
+            wait_time = await self._rate_limiter.acquire_order()
+            if wait_time > 0:
+                logger.debug(
+                    "Rate limited before submit",
+                    client_order_id=order.client_order_id,
+                    wait_seconds=wait_time,
+                )
+        
         # Update state
         order.update_state(OrderState.PENDING_NEW)
         order.submitted_at = time.time()
         self._pending_orders.add(order.client_order_id)
-        
+
+        # FIX #8: Persist updated state
+        if self._persistence:
+            self._persistence.save_order(order)
+
         if self.dry_run:
             # Simulate immediate acknowledgment
             logger.info(
@@ -331,6 +379,11 @@ class OrderManager:
             order.exchange_order_id = f"dry_run_{order.client_order_id}"
             self._pending_orders.discard(order.client_order_id)
             self._total_submitted += 1
+
+            # FIX #8: Persist NEW state
+            if self._persistence:
+                self._persistence.save_order(order)
+
             return True
         
         # Real submission via callback
@@ -374,6 +427,16 @@ class OrderManager:
                 state=order.state.value,
             )
             return False
+        
+        # FIX #6: Enforce rate limit before cancellation
+        if self._rate_limiter:
+            wait_time = await self._rate_limiter.acquire_order()
+            if wait_time > 0:
+                logger.debug(
+                    "Rate limited before cancel",
+                    client_order_id=order.client_order_id,
+                    wait_seconds=wait_time,
+                )
         
         order.update_state(OrderState.PENDING_CANCEL)
         
@@ -509,8 +572,174 @@ class OrderManager:
             reason=reason,
         )
     
+    async def timeout_stale_orders(
+        self,
+        max_pending_age_seconds: float = 30.0,
+        max_active_age_seconds: float = 300.0,
+    ) -> list[Order]:
+        """
+        Cancel orders that have been pending or active too long.
+
+        Args:
+            max_pending_age_seconds: Max time for pending acknowledgment
+            max_active_age_seconds: Max time for unfilled active orders
+
+        Returns:
+            List of orders that were timed out
+        """
+        timed_out = []
+        now = time.time()
+
+        for order in list(self._orders.values()):
+            should_timeout = False
+            reason = ""
+
+            # Check pending orders
+            if order.state == OrderState.PENDING_NEW:
+                if order.submitted_at and (now - order.submitted_at) > max_pending_age_seconds:
+                    should_timeout = True
+                    reason = f"Pending for {now - order.submitted_at:.1f}s"
+
+            # Check active unfilled orders
+            elif order.state.is_active and order.filled_size == 0:
+                if (now - order.created_at) > max_active_age_seconds:
+                    should_timeout = True
+                    reason = f"Active unfilled for {now - order.created_at:.1f}s"
+
+            if should_timeout:
+                logger.warning(
+                    "Timing out stale order",
+                    client_order_id=order.client_order_id,
+                    state=order.state.value,
+                    reason=reason,
+                )
+
+                if order.state.is_active:
+                    await self.cancel_order(order)
+                else:
+                    order.update_state(OrderState.EXPIRED)
+                    order.error_message = f"Timed out: {reason}"
+                    self._pending_orders.discard(order.client_order_id)
+
+                timed_out.append(order)
+
+        return timed_out
+
+    async def amend_order(
+        self,
+        order: Order,
+        new_price: float | None = None,
+        new_size: float | None = None,
+        amend_callback: OrderCallback | None = None,
+    ) -> bool:
+        """
+        Amend an existing order (cancel-replace).
+
+        This performs an atomic cancel-replace operation. If the exchange
+        supports native amend, use that. Otherwise, cancel and recreate.
+
+        Args:
+            order: Order to amend
+            new_price: New price (None = keep current)
+            new_size: New size (None = keep current)
+            amend_callback: Optional callback for native amend
+
+        Returns:
+            True if amend was successful
+        """
+        if not order.state.is_active:
+            logger.warning(
+                "Cannot amend order in current state",
+                client_order_id=order.client_order_id,
+                state=order.state.value,
+            )
+            return False
+
+        # Use provided values or keep existing
+        final_price = new_price if new_price is not None else order.price
+        final_size = new_size if new_size is not None else order.size
+
+        # Check if amend is actually needed
+        if final_price == order.price and final_size == order.size:
+            logger.debug("Amend requested but no changes", client_order_id=order.client_order_id)
+            return True
+
+        logger.info(
+            "Amending order",
+            client_order_id=order.client_order_id,
+            old_price=order.price,
+            new_price=final_price,
+            old_size=order.size,
+            new_size=final_size,
+        )
+
+        if self.dry_run:
+            # Simulate amend
+            order.price = final_price
+            order.size = final_size
+            order.updated_at = time.time()
+            logger.info(
+                "DRY RUN: Order amended",
+                client_order_id=order.client_order_id,
+            )
+            return True
+
+        # Try native amend if available
+        if amend_callback:
+            try:
+                # Create amended order info
+                amended = Order(
+                    client_order_id=order.client_order_id,
+                    token_id=order.token_id,
+                    side=order.side,
+                    price=final_price,
+                    size=final_size,
+                    order_type=order.order_type,
+                    exchange_order_id=order.exchange_order_id,
+                )
+                await amend_callback(amended)
+
+                # Update local order
+                order.price = final_price
+                order.size = final_size
+                order.updated_at = time.time()
+                return True
+
+            except Exception as e:
+                logger.warning(
+                    "Native amend failed, falling back to cancel-replace",
+                    error=str(e),
+                )
+
+        # Fallback: Cancel and replace
+        if not await self.cancel_order(order):
+            logger.error("Amend failed: could not cancel original order")
+            return False
+
+        # Create replacement order
+        new_order = self.create_order(
+            token_id=order.token_id,
+            side=order.side,
+            price=final_price,
+            size=final_size,
+            order_type=order.order_type,
+            strategy_id=order.strategy_id,
+        )
+
+        return await self.submit_order(new_order)
+
+    def get_orders_by_state(self, state: OrderState) -> list[Order]:
+        """Get all orders in a specific state."""
+        return [o for o in self._orders.values() if o.state == state]
+
+    def get_fill_rate(self) -> float:
+        """Get the fill rate (filled / submitted)."""
+        if self._total_submitted == 0:
+            return 0.0
+        return self._total_filled / self._total_submitted
+
     @property
-    def stats(self) -> dict[str, int]:
+    def stats(self) -> dict[str, int | float]:
         """Get order statistics."""
         return {
             "total_orders": len(self._orders),
@@ -520,4 +749,5 @@ class OrderManager:
             "filled": self._total_filled,
             "canceled": self._total_canceled,
             "rejected": self._total_rejected,
+            "fill_rate": self.get_fill_rate(),
         }

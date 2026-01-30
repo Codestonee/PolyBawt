@@ -102,6 +102,14 @@ def configure_logging(log_level: str = "INFO", log_format: str = "json") -> None
         stream=sys.stdout,
         level=logging.getLevelName(log_level),
     )
+    
+    # Silence noisy HTTP libraries
+    for noisy_logger in [
+        "httpx", "httpcore", "httpcore.http2", "httpcore.http11",
+        "hpack", "hpack.hpack", "urllib3", "aiohttp", 
+        "aiohttp.client", "websockets", "h2",
+    ]:
+        logging.getLogger(noisy_logger).setLevel(logging.WARNING)
 
 
 def get_logger(name: str) -> structlog.BoundLogger:

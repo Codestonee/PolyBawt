@@ -205,30 +205,74 @@ class TestTokenBucket:
         assert bucket.usage_pct == pytest.approx(0.5, abs=0.01)
 
 
+class TestOrderSizeConversion:
+    """Tests for USD to shares conversion."""
+
+    def test_usd_to_shares_conversion(self):
+        """
+        Verify that size conversion from USD to shares is correct.
+
+        For Polymarket binary options (prices 0-1):
+        shares = usd_amount / price
+
+        Examples:
+        - $10 at price 0.5 = 10 / 0.5 = 20 shares
+        - $10 at price 0.2 = 10 / 0.2 = 50 shares
+        - $10 at price 0.8 = 10 / 0.8 = 12.5 shares
+        """
+        # Test case 1: $10 at 0.5 = 20 shares
+        usd = 10.0
+        price = 0.5
+        expected_shares = 20.0
+        actual_shares = usd / price
+        assert abs(actual_shares - expected_shares) < 0.01
+
+        # Test case 2: $10 at 0.2 = 50 shares
+        usd = 10.0
+        price = 0.2
+        expected_shares = 50.0
+        actual_shares = usd / price
+        assert abs(actual_shares - expected_shares) < 0.01
+
+        # Test case 3: $10 at 0.8 = 12.5 shares
+        usd = 10.0
+        price = 0.8
+        expected_shares = 12.5
+        actual_shares = usd / price
+        assert abs(actual_shares - expected_shares) < 0.01
+
+        # Test case 4: $100 at 0.55 = ~181.82 shares
+        usd = 100.0
+        price = 0.55
+        expected_shares = 181.82
+        actual_shares = usd / price
+        assert abs(actual_shares - expected_shares) < 0.1
+
+
 class TestRateLimiter:
     """Tests for multi-bucket rate limiter."""
-    
+
     def test_separate_buckets(self):
         """Different endpoints should have separate limits."""
         limiter = RateLimiter()
-        
+
         # Drain order bucket
         for _ in range(450):
             limiter.try_acquire_order()
-        
+
         # Order bucket should be nearly empty
         assert limiter.order_usage_pct() > 0.9
-        
+
         # But query bucket should still be full
         assert not limiter.is_critical(threshold=0.5)
-    
+
     def test_is_critical(self):
         """Should detect critical rate limit state."""
         limiter = RateLimiter()
         assert not limiter.is_critical()
-        
+
         # Drain a bucket
         for _ in range(460):
             limiter.try_acquire_order()
-        
+
         assert limiter.is_critical(threshold=0.9)

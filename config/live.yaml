@@ -1,0 +1,54 @@
+# Live Trading Configuration
+# REAL MONEY - Use with caution!
+
+environment: live
+
+api:
+  clob_base_url: "https://clob.polymarket.com"
+  gamma_base_url: "https://gamma-api.polymarket.com"
+  ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+  polygon_chain_id: 137
+
+trading:
+  assets: [BTC, ETH, SOL, XRP]
+  bankroll: 72.08 # Updated balance after wins
+  min_edge_threshold: 0.02 # 2% minimum edge
+  kelly_fraction: 0.35 # Increased for bigger bets on good edges
+  max_position_pct: 0.15 # 15% max allows Kelly to size adaptively
+  max_asset_exposure_pct: 0.20 # Allow concentration in best opportunities
+  cutoff_seconds: 60
+  min_seconds_after_open: 30
+
+risk:
+  daily_loss_soft_limit_pct: 0.15 # 15% soft warning ($10.81)
+  daily_loss_hard_limit_pct: 0.25 # 25% hard limit ($18.02)
+  max_drawdown_pct: 0.30 # 30% max drawdown before halt
+  volatility_pause_threshold: 2.0
+  correlation_reduction_threshold: 0.8
+
+execution:
+  rate_limit_buffer_pct: 0.10
+  ws_reconnect_initial_ms: 100
+  ws_reconnect_max_ms: 5000
+  ws_reconnect_multiplier: 2.0
+  ws_reconnect_jitter: 0.2
+  order_timeout_ms: 5000
+  max_retries: 3
+
+models:
+  jump_intensity_per_day: 2.0
+  jump_size_std: 0.02
+  default_volatility:
+    BTC: 0.60
+    ETH: 0.70
+    SOL: 0.85
+    XRP: 0.90
+
+observability:
+  log_level: INFO
+  log_format: text
+  metrics_port: 9090
+  telegram_enabled: false
+
+# LIVE TRADING - Real orders!
+dry_run: false
