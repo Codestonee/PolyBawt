@@ -264,7 +264,8 @@ class TestRateLimiter:
         assert limiter.order_usage_pct() > 0.9
 
         # But query bucket should still be full
-        assert not limiter.is_critical(threshold=0.5)
+        query_bucket = limiter._buckets["queries"]
+        assert query_bucket.usage_pct < 0.1
 
     def test_is_critical(self):
         """Should detect critical rate limit state."""

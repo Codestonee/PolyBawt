@@ -244,10 +244,19 @@ class CLOBClient:
                     timestamp=time.time(),
                 )
             else:
+                # FIX #7: Parse actual error details
+                error_msg = str(response)
+                error_code = "UNKNOWN"
+                
+                if isinstance(response, dict):
+                    error_msg = response.get("error") or response.get("errorMsg") or str(response)
+                    if response.get("code"):
+                        error_code = str(response.get("code"))
+                
                 return OrderResponse(
                     success=False,
-                    error_code="UNKNOWN",
-                    error_message=str(response),
+                    error_code=error_code,
+                    error_message=error_msg,
                 )
 
         except Exception as e:
@@ -296,6 +305,42 @@ class CLOBClient:
                 self._clob_client.cancel, exchange_order_id
             )
             
+            # FIX: Verify cancel response instead of assuming success
+            # The API may return an error object or indicate failure
+            if response is None:
+                logger.warning(
+                    "Cancel returned None response",
+                    exchange_order_id=exchange_order_id,
+                )
+                return CancelResponse(
+                    success=False,
+                    error_message="Cancel returned None response",
+                )
+            
+            # Check for error fields in response
+            if isinstance(response, dict):
+                if response.get("error") or response.get("errorMsg"):
+                    error_msg = response.get("error") or response.get("errorMsg") or "Unknown cancel error"
+                    logger.error(
+                        "Cancel API returned error",
+                        exchange_order_id=exchange_order_id,
+                        error=error_msg,
+                    )
+                    return CancelResponse(
+                        success=False,
+                        error_message=str(error_msg),
+                    )
+                # Check for success indicators
+                if response.get("canceled") == False or response.get("success") == False:
+                    return CancelResponse(
+                        success=False,
+                        error_message=f"Cancel rejected: {response}",
+                    )
+            
+            logger.info(
+                "Order cancelled successfully",
+                exchange_order_id=exchange_order_id,
+            )
             return CancelResponse(success=True)
             
         except Exception as e:

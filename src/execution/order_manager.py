@@ -135,6 +135,23 @@ class Order:
         if fill_size <= 0:
             return
         
+        # FIX: Clamp fill_size to remaining_size to prevent overfills
+        remaining = self.remaining_size
+        if fill_size > remaining:
+            from src.infrastructure.logging import get_logger
+            logger = get_logger(__name__)
+            logger.warning(
+                "Fill exceeds remaining size, clamping",
+                client_order_id=self.client_order_id,
+                fill_size=fill_size,
+                remaining_size=remaining,
+                clamped_to=remaining,
+            )
+            fill_size = remaining
+        
+        if fill_size <= 0:
+            return  # Nothing left to fill
+        
         # Update weighted average price
         old_value = self.filled_size * self.average_fill_price
         new_value = fill_size * fill_price
@@ -454,6 +471,11 @@ class OrderManager:
                 await self._cancel_callback(order)
                 order.update_state(OrderState.CANCELED)
                 self._total_canceled += 1
+                
+                # FIX #8: Persist updated state after cancel
+                if self._persistence:
+                    self._persistence.save_order(order)
+                    
                 return True
             except Exception as e:
                 # Revert to previous active state
@@ -549,6 +571,10 @@ class OrderManager:
         if order.state == OrderState.FILLED:
             self._total_filled += 1
         
+        # FIX #8: Persist updated state after fill
+        if self._persistence:
+            self._persistence.save_order(order)
+            
         return True
     
     def handle_rejection(
@@ -565,6 +591,10 @@ class OrderManager:
         order.error_message = reason
         self._pending_orders.discard(client_order_id)
         self._total_rejected += 1
+        
+        # FIX #8: Persist updated state after rejection
+        if self._persistence:
+            self._persistence.save_order(order)
         
         logger.warning(
             "Order rejected",

@@ -37,6 +37,15 @@ class TradingConfig(BaseModel):
     cutoff_seconds: int = 60  # Stop trading before expiry
     min_seconds_after_open: int = 30  # Avoid opening volatility
     
+    # Favorite fallback betting
+    favorite_bet_enabled: bool = True
+    favorite_bet_size: float = 2.00  # USD
+    
+    # Arbitrage trading
+    arbitrage_enabled: bool = True
+    arbitrage_min_profit_pct: float = 0.005  # 0.5% minimum profit
+    arbitrage_max_size: float = 50.00  # Max USD per arb trade
+    
     @field_validator("kelly_fraction")
     @classmethod
     def validate_kelly(cls, v: float) -> float:

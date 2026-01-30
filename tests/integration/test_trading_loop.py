@@ -9,15 +9,15 @@ import pytest
 from datetime import datetime, timezone, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from src.strategy.value_betting import ValueBettingStrategy, TradeSignal, StrategyMetrics
+from src.strategy.value_betting import ValueBettingStrategy, TradeSignal, StrategyMetrics, PendingFill
 from src.models.ev_calculator import EVCalculator, TradeSide
 from src.models.jump_diffusion import JumpDiffusionModel, JumpDiffusionParams
 from src.models.advanced_pricing import BatesModel, KouModel, EnsemblePricingModel
 from src.risk.kelly_sizer import KellySizer, AdaptiveMode
-from src.risk.circuit_breaker import CircuitBreaker, CircuitBreakerConfig, BreakerState
+from src.risk.circuit_breaker import CircuitBreaker, CircuitBreakerConfig, BreakerState, BreakerType
 from src.execution.order_manager import OrderManager, OrderState, OrderSide
 from src.execution.rate_limiter import RateLimiter
-from src.portfolio.tracker import Portfolio
+from src.portfolio.tracker import Portfolio, PositionSide
 from src.infrastructure.config import AppConfig, TradingConfig
 from src.ingestion.market_discovery import Market
 
@@ -43,12 +43,14 @@ def mock_market():
     return Market(
         condition_id="test_cond_123",
         question="Will BTC be above $100,000 at 12:15 UTC?",
+        slug="btc-updown-1215",  # Added slug
         asset="BTC",
         yes_token_id="yes_token_abc",
         no_token_id="no_token_xyz",
         yes_price=0.50,
+        no_price=0.50,
         end_date=datetime.now(timezone.utc) + timedelta(minutes=10),
-        start_date=datetime.now(timezone.utc) - timedelta(minutes=5),
+        # start_date removed (not in Market dataclass)
         open_price=100000,
     )
 
@@ -88,9 +90,17 @@ class TestTradingLoopIntegration:
         mock_discovery = AsyncMock()
         mock_discovery.get_crypto_15m_markets.return_value = [mock_market]
 
-        mock_oracle = AsyncMock()
-        mock_oracle.get_all_prices.return_value = {"BTC": 100500}  # Above open
-        mock_oracle.get_cached_price.return_value = MagicMock(age_seconds=1.0)
+        # Fix: Helper to return non-coroutine mock
+        mock_price = MagicMock()
+        mock_price.age_seconds = 1.0
+
+        async def get_cached_price_side_effect(*args, **kwargs):
+            return mock_price
+
+        mock_oracle = MagicMock()
+        mock_oracle.get_all_prices = AsyncMock(return_value={"BTC": 100500})
+        # Fix: get_cached_price is synchronous
+        mock_oracle.get_cached_price = MagicMock(return_value=mock_price)
 
         # Create strategy
         strategy = ValueBettingStrategy(
@@ -130,9 +140,13 @@ class TestTradingLoopIntegration:
         mock_discovery = AsyncMock()
         mock_discovery.get_crypto_15m_markets.return_value = [mock_market]
 
-        mock_oracle = AsyncMock()
-        mock_oracle.get_all_prices.return_value = {"BTC": 100500}
-        mock_oracle.get_cached_price.return_value = MagicMock(age_seconds=1.0)
+        mock_price = MagicMock()
+        mock_price.age_seconds = 1.0
+
+        mock_oracle = MagicMock()
+        mock_oracle.get_all_prices = AsyncMock(return_value={"BTC": 100500})
+        # Fix: get_cached_price is synchronous
+        mock_oracle.get_cached_price = MagicMock(return_value=mock_price)
 
         strategy = ValueBettingStrategy(
             config=app_config,
@@ -161,9 +175,14 @@ class TestTradingLoopIntegration:
     ):
         """Test that fills properly update portfolio state."""
         mock_discovery = AsyncMock()
-        mock_oracle = AsyncMock()
-        mock_oracle.get_all_prices.return_value = {"BTC": 100500}
-        mock_oracle.get_cached_price.return_value = MagicMock(age_seconds=1.0)
+        
+        mock_price = MagicMock()
+        mock_price.age_seconds = 1.0
+        
+        mock_oracle = MagicMock()
+        mock_oracle.get_all_prices = AsyncMock(return_value={"BTC": 100500})
+        # Fix: get_cached_price is synchronous
+        mock_oracle.get_cached_price = MagicMock(return_value=mock_price)
 
         portfolio = Portfolio(starting_capital=1000)
 
@@ -189,15 +208,15 @@ class TestTradingLoopIntegration:
         await order_manager.submit_order(order)
 
         # Register pending fill metadata
-        strategy._pending_fills[order.client_order_id] = {
-            "token_id": "test_token",
-            "asset": "BTC",
-            "side": "LONG_YES",
-            "price": 0.55,
-            "size_usd": 10.0,
-            "market_question": "Test question",
-            "expires_at": datetime.now(timezone.utc).timestamp() + 600,
-        }
+        strategy._pending_fills[order.client_order_id] = PendingFill(
+            token_id="test_token",
+            asset="BTC",
+            side=PositionSide.LONG_YES,
+            price=0.55,
+            size_usd=10.0,
+            market_question="Test question",
+            expires_at=datetime.now(timezone.utc).timestamp() + 600,
+        )
 
         # Simulate fill
         strategy.handle_fill(order.client_order_id, 10.0, 0.55)
@@ -361,7 +380,7 @@ class TestCircuitBreakerIntegration:
 
         # Trip a breaker
         breaker.update_volatility(1.6)  # Soft trip
-        assert breaker._states[breaker._states.__class__.__members__['VOLATILITY']] != BreakerState.CLOSED
+        assert breaker._states[BreakerType.VOLATILITY] != BreakerState.CLOSED
 
         # Wait for cooldown
         time.sleep(0.2)

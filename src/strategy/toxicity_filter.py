@@ -23,6 +23,7 @@ class ToxicityReason(str, Enum):
     WIDE_SPREAD = "wide_spread"
     THIN_BOOK = "thin_book"
     RAPID_PRICE_MOVE = "rapid_price_move"
+    VPIN_HIGH = "vpin_high"  # NEW: Research-backed (Claude/Perplexity/Gemini)
     NONE = "none"
 
 
@@ -73,6 +74,7 @@ class ToxicityFilter:
         spread_threshold: float = 0.08,      # 8% spread is wide
         min_depth_usd: float = 50.0,         # Minimum $50 depth
         price_move_threshold: float = 0.05,  # 5% rapid move
+        vpin_threshold: float = 0.7,         # VPIN > 0.7 = extremely toxic (research)
     ):
         """
         Initialize toxicity filter.
@@ -87,6 +89,7 @@ class ToxicityFilter:
         self.spread_threshold = spread_threshold
         self.min_depth_usd = min_depth_usd
         self.price_move_threshold = price_move_threshold
+        self.vpin_threshold = vpin_threshold  # NEW
         
         # Track recent prices for momentum detection
         self._recent_prices: list[float] = []
@@ -97,6 +100,7 @@ class ToxicityFilter:
         order_book: OrderBook,
         recent_price: Optional[float] = None,
         current_price: Optional[float] = None,
+        vpin: Optional[float] = None,  # NEW: VPIN from WebSocket client
     ) -> ToxicityResult:
         """
         Analyze order book and price action for toxicity.
@@ -129,6 +133,12 @@ class ToxicityFilter:
             momentum_result = self._check_momentum(recent_price, current_price)
             if momentum_result.is_toxic:
                 return momentum_result
+        
+        # 5. Check VPIN (research-backed: Claude/Perplexity/Gemini)
+        if vpin is not None:
+            vpin_result = self._check_vpin(vpin)
+            if vpin_result.is_toxic:
+                return vpin_result
         
         # All clear
         return ToxicityResult(
@@ -279,6 +289,39 @@ class ToxicityFilter:
         if len(self._recent_prices) >= 3:
             return self._recent_prices[-3]
         return None
+    
+    def _check_vpin(self, vpin: float) -> ToxicityResult:
+        """
+        Check for high VPIN (Volume-Synchronized Probability of Informed Trading).
+        
+        Research finding (Claude/Perplexity/Gemini):
+        - VPIN > 0.7: Extremely toxic (informed trading, stop quoting)
+        - VPIN > 0.5: Moderately toxic
+        - VPIN < 0.3: Normal uninformed flow (safe to market make)
+        
+        "VPIN was able to foresee the flash crash and predict short-term
+        volatility... Order flow is regarded as toxic when it adversely
+        selects market makers."
+        """
+        if vpin > self.vpin_threshold:
+            severity = min(1.0, (vpin - self.vpin_threshold) / (1 - self.vpin_threshold))
+            
+            logger.warning(
+                "High VPIN detected (informed trading)",
+                vpin=f"{vpin:.2f}",
+                threshold=f"{self.vpin_threshold:.2f}",
+            )
+            
+            return ToxicityResult(
+                is_toxic=True,
+                reason=ToxicityReason.VPIN_HIGH,
+                severity=severity,
+                message=f"VPIN {vpin:.2f} exceeds threshold {self.vpin_threshold:.2f} - likely informed flow",
+                should_reduce_size=True,
+                should_pause=vpin > 0.85,  # Extreme toxicity
+            )
+        
+        return ToxicityResult(is_toxic=False, reason=ToxicityReason.NONE, severity=0)
 
 
 # Pre-instantiated filter with default settings

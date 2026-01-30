@@ -480,7 +480,11 @@ class SentimentIntegrator:
         max_adjustment: float = 0.05,
     ) -> tuple[float, AggregateSentiment]:
         """
-        Adjust model probability based on sentiment.
+        [DEPRECATED] Adjust model probability based on sentiment.
+        
+        RESEARCH WARNING (Claude/Perplexity):
+        "Funding rate R² for next-period prediction is approximately zero."
+        Do NOT use this for probability adjustment. Use get_sizing_multiplier() instead.
 
         Args:
             model_prob: Original model probability
@@ -490,6 +494,12 @@ class SentimentIntegrator:
         Returns:
             Tuple of (adjusted_prob, sentiment_used)
         """
+        logger.warning(
+            "DEPRECATED: adjust_probability() should not be used. "
+            "Research shows funding rate R²≈0 for short-term price prediction. "
+            "Use get_sizing_multiplier() for Kelly sizing instead."
+        )
+        
         sentiment = self.get_sentiment(asset)
 
         if sentiment.confidence < 0.3:
@@ -516,6 +526,78 @@ class SentimentIntegrator:
             )
 
         return adjusted, sentiment
+    
+    def get_sizing_multiplier(
+        self,
+        asset: str,
+        trade_direction: str = "long",  # "long" or "short"
+    ) -> tuple[float, AggregateSentiment]:
+        """
+        Get Kelly sizing multiplier based on sentiment.
+        
+        RESEARCH-BACKED (Claude/Perplexity/Grok):
+        "Funding rates have ~0 R² for next-period price prediction, but 
+        are useful as regime filters for position sizing conviction."
+        
+        Use this to adjust Kelly fraction, NOT probability.
+        
+        Weighting scheme (Perplexity):
+        - Funding rate: 60%
+        - Order flow imbalance: 25%  
+        - Fear & Greed: 10%
+        - Social: 5%
+        
+        Args:
+            asset: Asset symbol (BTC, ETH, etc.)
+            trade_direction: "long" or "short"
+            
+        Returns:
+            Tuple of (sizing_multiplier, sentiment_used)
+            - multiplier in range [0.5, 1.5]
+            - 1.0 = neutral (no size change)
+            - 0.5 = reduce size by 50% (sentiment contradicts trade)
+            - 1.5 = increase size by 50% (sentiment aligns with trade)
+        """
+        sentiment = self.get_sentiment(asset)
+        
+        if sentiment.confidence < 0.3:
+            logger.debug(
+                "Sentiment confidence too low for sizing adjustment",
+                asset=asset,
+                confidence=sentiment.confidence,
+            )
+            return 1.0, sentiment
+        
+        # Determine if sentiment aligns with trade direction
+        # Bullish sentiment (positive score) aligns with long trades
+        # Bearish sentiment (negative score) aligns with short trades
+        score = sentiment.composite_score  # Range [-1, +1]
+        
+        if trade_direction == "long":
+            alignment = score  # Positive = aligned
+        else:  # short
+            alignment = -score  # Negative sentiment = aligned with short
+        
+        # Calculate multiplier:
+        # alignment > 0 → increase size (up to 1.5)
+        # alignment < 0 → decrease size (down to 0.5)
+        # Base formula: 1.0 + (alignment * 0.5 * confidence)
+        multiplier = 1.0 + (alignment * 0.5 * sentiment.confidence)
+        
+        # Clamp to [0.5, 1.5]
+        multiplier = max(0.5, min(1.5, multiplier))
+        
+        logger.debug(
+            "Sentiment sizing adjustment",
+            asset=asset,
+            direction=trade_direction,
+            sentiment_score=f"{score:.2f}",
+            sentiment_level=sentiment.composite_level.value,
+            alignment=f"{alignment:.2f}",
+            sizing_multiplier=f"{multiplier:.2f}",
+        )
+        
+        return multiplier, sentiment
 
     async def close(self) -> None:
         """Clean up resources."""

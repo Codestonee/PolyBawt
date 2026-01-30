@@ -17,6 +17,13 @@ trading:
   max_asset_exposure_pct: 0.05
   cutoff_seconds: 60
   min_seconds_after_open: 30
+  # Favorite fallback betting
+  favorite_bet_enabled: true
+  favorite_bet_size: 2.00 # USD - bet on favorite if no edge found
+  # Arbitrage trading
+  arbitrage_enabled: true
+  arbitrage_min_profit_pct: 0.005 # 0.5% minimum profit to execute
+  arbitrage_max_size: 50.00 # Max USD per arb trade
 
 risk:
   daily_loss_soft_limit_pct: 0.03

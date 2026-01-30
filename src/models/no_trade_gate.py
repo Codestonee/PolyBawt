@@ -76,7 +76,7 @@ class TradeContext:
     # Market quality
     spread: float = 0  # Bid-ask spread
     book_depth_usd: float = 1000  # Depth on our side
-    oracle_age_seconds: float = 0
+    oracle_age_seconds: float | None = None  # None means missing data (fail-safe)
     
     # Portfolio state
     current_position_usd: float = 0
@@ -302,6 +302,21 @@ class NoTradeGate:
     def _check_oracle_freshness(
         self, ctx: TradeContext
     ) -> tuple[RejectionReason | None, str]:
+        # FIX: Treat missing oracle data as stale
+        # If oracle_age_seconds is None, 0, or very small, data may be missing
+        if ctx.oracle_age_seconds is None:
+            return (
+                RejectionReason.ORACLE_STALE,
+                "Oracle data missing (age is None)"
+            )
+        
+        # Age of 0 likely means no timestamp was set - treat as stale
+        if ctx.oracle_age_seconds <= 0:
+            return (
+                RejectionReason.ORACLE_STALE,
+                f"Oracle age suspicious ({ctx.oracle_age_seconds}s) - may be missing"
+            )
+        
         if ctx.oracle_age_seconds > self.config.max_oracle_age_seconds:
             return (
                 RejectionReason.ORACLE_STALE,

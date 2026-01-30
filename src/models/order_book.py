@@ -99,3 +99,7 @@ class OrderBook:
         bid_depth = sum(price * size for price, size in self.bids[:levels])
         ask_depth = sum(price * size for price, size in self.asks[:levels])
         return bid_depth + ask_depth
+
+    def get(self, key: str, default: any = None) -> any:
+        """Dict-like access for compatibility."""
+        return getattr(self, key, default)

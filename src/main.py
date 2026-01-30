@@ -87,6 +87,10 @@ async def run_strategy(config: AppConfig) -> None:
     circuit_breaker = CircuitBreaker(starting_capital=bankroll)
 
     portfolio = Portfolio(starting_capital=bankroll)
+    
+    # Sync to global state for API
+    from src.api.state import get_state
+    get_state().portfolio = portfolio
 
     # Create strategy
     strategy = ValueBettingStrategy(
@@ -153,6 +157,16 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Run for N iterations then stop (default: run forever)",
     )
+    parser.add_argument(
+        "--clean",
+        action="store_true",
+        help="Use clean, minimal log format for easier terminal reading",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose/debug logging",
+    )
     return parser.parse_args()
 
 
@@ -174,9 +188,12 @@ async def async_main() -> None:
         config.dry_run = True
     
     # Configure logging
+    log_format = "clean" if args.clean else config.observability.log_format
+    log_level = "DEBUG" if args.verbose else config.observability.log_level
+    
     configure_logging(
-        log_level=config.observability.log_level,
-        log_format=config.observability.log_format,
+        log_level=log_level,
+        log_format=log_format,
     )
     
     logger = get_logger(__name__)
@@ -186,8 +203,28 @@ async def async_main() -> None:
         dry_run=config.dry_run,
         config_file=args.config,
     )
+
+    # Start API server in background
+    import uvicorn
+    from src.api.server import app
+    from src.api.state import get_state
+
+    api_config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="error")
+    server = uvicorn.Server(api_config)
     
-    await run_strategy(config)
+    # Run API server concurrently with strategy
+    api_task = asyncio.create_task(server.serve())
+    get_state().is_running = True
+    
+    try:
+        await run_strategy(config)
+    finally:
+        get_state().is_running = False
+        api_task.cancel()
+        try:
+            await api_task
+        except asyncio.CancelledError:
+            pass
 
 
 def main() -> None:

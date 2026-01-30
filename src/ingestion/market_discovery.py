@@ -9,6 +9,7 @@ Provides:
 
 import asyncio
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -204,37 +205,61 @@ class MarketDiscovery:
                 slug = f"{asset_lower}-updown-15m-{epoch}"
                 url = f"{self.base_url}/events/slug/{slug}"
                 
-                try:
-                    async with session.get(url) as resp:
-                        if resp.status != 200:
-                            continue  # This epoch doesn't exist
-                        
-                        event_data = await resp.json()
-                        event_markets = event_data.get("markets", [])
-                        
-                        for raw in event_markets:
-                            # Merge event-level data into market
-                            raw["slug"] = event_data.get("slug", slug)
-                            raw["question"] = event_data.get("title", raw.get("question", ""))
+                # FIX: Add retry with exponential backoff
+                max_retries = 3
+                base_delay = 0.5
+                
+                for attempt in range(max_retries):
+                    try:
+                        async with session.get(url) as resp:
+                            if resp.status == 404:
+                                break  # This epoch doesn't exist, no retry needed
+                            elif resp.status != 200:
+                                if attempt < max_retries - 1:
+                                    delay = base_delay * (2 ** attempt)
+                                    logger.debug(
+                                        "Retrying after error",
+                                        slug=slug,
+                                        status=resp.status,
+                                        attempt=attempt + 1,
+                                        delay=delay,
+                                    )
+                                    await asyncio.sleep(delay)
+                                    continue
+                                else:
+                                    break  # Give up after max retries
                             
-                            market = self._parse_market(raw)
-                            if market is not None and not market.is_expired:
-                                # Force 15m flag and asset
-                                market.is_15m = True
-                                market.asset = asset.upper()
-                                market.interval_minutes = 15
-                                markets.append(market)
-                                logger.debug(
-                                    "Found 15m market via slug",
-                                    asset=asset,
-                                    epoch=epoch,
-                                    slug=slug,
-                                    expires_in=f"{market.minutes_to_expiry:.1f}m"
-                                )
+                            event_data = await resp.json()
+                            event_markets = event_data.get("markets", [])
+                            
+                            for raw in event_markets:
+                                # Merge event-level data into market
+                                raw["slug"] = event_data.get("slug", slug)
+                                raw["question"] = event_data.get("title", raw.get("question", ""))
                                 
-                except aiohttp.ClientError as e:
-                    logger.debug("Failed to fetch 15m market", slug=slug, error=str(e))
-                    continue
+                                market = self._parse_market(raw)
+                                if market is not None and not market.is_expired:
+                                    # Force 15m flag and asset
+                                    market.is_15m = True
+                                    market.asset = asset.upper()
+                                    market.interval_minutes = 15
+                                    markets.append(market)
+                                    logger.debug(
+                                        "Found 15m market via slug",
+                                        asset=asset,
+                                        epoch=epoch,
+                                        slug=slug,
+                                        expires_in=f"{market.minutes_to_expiry:.1f}m"
+                                    )
+                            break  # Success, no more retries needed
+                                    
+                    except aiohttp.ClientError as e:
+                        if attempt < max_retries - 1:
+                            delay = base_delay * (2 ** attempt)
+                            await asyncio.sleep(delay)
+                        else:
+                            logger.debug("Failed to fetch 15m market after retries", slug=slug, error=str(e))
+                        continue
         
         logger.info(
             "Found 15m crypto markets",
@@ -310,13 +335,21 @@ class MarketDiscovery:
                     except (ValueError, TypeError):
                         pass
 
-            # If no open_price in metadata, it will need to be fetched from oracle
-            # (deferred to strategy layer since we don't have oracle access here)
-            if open_price is None and is_15m and created_at:
-                logger.debug(
-                    "No open_price in API metadata (will need historical fetch)",
+            # FALLBACK: Try to parse reference price from question text
+            if open_price is None:
+                open_price = self._parse_reference_price_from_question(question)
+                if open_price is not None:
+                    logger.info(
+                        "Extracted open_price from question text",
+                        asset=asset,
+                        open_price=open_price,
+                    )
+
+            # If STILL no open_price, log warning (strategy will need to handle this)
+            if open_price is None and is_15m:
+                logger.warning(
+                    "No open_price found - model accuracy will be degraded",
                     question=question[:50],
-                    created_at=created_at.isoformat(),
                 )
 
             return Market(
@@ -355,6 +388,52 @@ class MarketDiscovery:
             return "XRP"
         
         return ""
+    
+    def _parse_reference_price_from_question(self, question: str) -> float | None:
+        """
+        Extract reference price from market question text.
+        
+        Examples:
+            "Will the price of BTC be 103,500 USDT or higher..." -> 103500.0
+            "Will ETH be $3,250 or higher at 2:30 PM?" -> 3250.0
+            "Will SOL price be 175.50 or above..." -> 175.50
+        
+        Returns:
+            Reference price as float, or None if not found
+        """
+        # Pattern matches numbers like: 103,500 or 3250.50 or $3,175
+        # Captures the numeric part, handles commas and decimals
+        patterns = [
+            # "be $103,500 USDT or higher" or "be 103,500 or higher"
+            r"be\s+\$?([\d]+(?:,\d{3})*(?:\.\d+)?)\s*(?:USDT|USD|or higher|or above)",
+            # "price of $103500" or "price be 103,500"
+            r"price\s+(?:of\s+)?(?:be\s+)?\$?([\d]+(?:,\d{3})*(?:\.\d+)?)",
+            # "above $103,500" or "at 103,500"
+            r"(?:above|at|over)\s+\$?([\d]+(?:,\d{3})*(?:\.\d+)?)",
+            # Fallback: any "$" followed by a number (e.g., "$3,250")
+            r"\$([\d]+(?:,\d{3})*(?:\.\d+)?)",
+            # Fallback: "be <number>" more permissive
+            r"be\s+([\d,]+(?:\.\d+)?)\s",
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, question, re.IGNORECASE)
+            if match:
+                try:
+                    # Remove commas and convert to float
+                    price_str = match.group(1).replace(",", "")
+                    price = float(price_str)
+                    if price > 0:
+                        logger.debug(
+                            "Parsed reference price from question",
+                            price=price,
+                            question=question[:60],
+                        )
+                        return price
+                except (ValueError, IndexError):
+                    continue
+        
+        return None
     
     def _is_15m_market(
         self,
