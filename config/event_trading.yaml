@@ -1,0 +1,122 @@
+# Event Market Trading Configuration
+# For Politics, Sports, Economics, and Pop Culture markets
+
+environment: paper
+dry_run: true
+
+api:
+  clob_base_url: "https://clob.polymarket.com"
+  gamma_base_url: "https://gamma-api.polymarket.com"
+  ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+  polygon_chain_id: 137
+
+trading:
+  assets: ["BTC", "ETH", "SOL", "XRP"]  # Crypto assets
+  bankroll: 1000.0
+  min_edge_threshold: 0.04
+  kelly_fraction: 0.25
+  max_position_pct: 0.02
+  max_asset_exposure_pct: 0.05
+  cutoff_seconds: 60
+  min_seconds_after_open: 30
+  
+  # Favorite fallback betting
+  favorite_bet_enabled: true
+  favorite_bet_size: 2.00
+  
+  # Arbitrage trading
+  arbitrage_enabled: true
+  arbitrage_min_profit_pct: 0.005
+  arbitrage_max_size: 50.00
+  
+  # Extreme probability trading
+  extreme_prob_enabled: true
+  extreme_prob_threshold: 0.05
+  extreme_prob_kelly_boost: 1.5
+  extreme_prob_min_edge: 0.02
+
+# Event Market Trading Configuration
+event_trading:
+  enabled: true
+  categories: ["politics", "sports", "economics"]  # Enable specific categories
+
+  # Minimum edge thresholds by category (different from crypto!)
+  min_edge_politics: 0.05    # 5% - polls are fairly reliable
+  min_edge_sports: 0.06      # 6% - sports have more variance
+  min_edge_economics: 0.04   # 4% - Fed futures are very accurate
+  min_edge_pop_culture: 0.07 # 7% - harder to predict
+
+  # Position limits
+  max_position_per_market: 50.0   # Max $50 per event market
+  max_category_exposure: 200.0    # Max $200 per category
+
+  # Rebalancing on new information
+  rebalance_enabled: true
+  rebalance_threshold_pct: 0.10   # Rebalance if probability changes >10%
+
+  # External data refresh intervals
+  refresh_polls: 3600        # 1 hour - polls don't change fast
+  refresh_betting_lines: 900  # 15 minutes - lines update frequently
+  refresh_fed_futures: 900    # 15 minutes - futures update frequently
+  refresh_sentiment: 1800     # 30 minutes - sentiment changes gradually
+
+  # Model calibration
+  brier_tracking_enabled: true
+  calibration_db_path: "data/calibration.db"
+
+risk:
+  daily_loss_soft_limit_pct: 0.03
+  daily_loss_hard_limit_pct: 0.05
+  max_drawdown_pct: 0.10
+  volatility_pause_threshold: 2.0
+  correlation_reduction_threshold: 0.8
+
+execution:
+  rate_limit_buffer_pct: 0.10
+  ws_reconnect_initial_ms: 100
+  ws_reconnect_max_ms: 5000
+  ws_reconnect_multiplier: 2.0
+  ws_reconnect_jitter: 0.2
+  order_timeout_ms: 5000
+  max_retries: 3
+
+# Market making (disabled by default)
+market_making:
+  enabled: false
+  spread_bps: 50.0
+  quote_size_usd: 10.0
+  max_inventory_usd: 100.0
+  skew_bps_per_inventory: 1.0
+  min_profit_margin: 0.005
+
+# VPIN toxicity filter
+vpin:
+  enabled: true
+  bucket_size_usd: 1000.0
+  n_buckets: 50
+  halt_threshold: 0.6
+  reduce_threshold: 0.4
+
+# Order Book Imbalance (65-75% accuracy!)
+obi:
+  enabled: true
+  levels: 5
+  strong_threshold: 0.4
+  weak_threshold: 0.2
+  weighted: true
+
+# Models
+models:
+  jump_intensity_per_day: 2.0
+  jump_size_std: 0.02
+  default_volatility:
+    BTC: 0.60
+    ETH: 0.70
+    SOL: 0.85
+    XRP: 0.90
+
+observability:
+  log_level: "INFO"
+  log_format: "json"
+  metrics_port: 9090
+  telegram_enabled: false

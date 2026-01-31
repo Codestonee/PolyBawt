@@ -1,0 +1,23 @@
+# EMERGENCY STOP CONFIGURATION
+# Use this to safely halt all trading
+
+environment: paper  # Force paper mode
+dry_run: true      # Absolutely no live orders
+
+trading:
+  assets: []  # Empty = no markets
+  bankroll: 0.58  # Your remaining balance
+
+# All strategies OFF
+market_making:
+  enabled: false
+
+event_trading:
+  enabled: false
+  categories: []
+
+# Circuit breakers at zero (immediate halt)
+risk:
+  daily_loss_soft_limit_pct: 0.001  # 0.1%
+  daily_loss_hard_limit_pct: 0.001  # 0.1%
+  max_drawdown_pct: 0.001  # 0.1%
