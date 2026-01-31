@@ -25,7 +25,7 @@ from src.ingestion.oracle_feed import OracleFeed
 from src.execution.order_manager import OrderManager
 from src.execution.rate_limiter import RateLimiter
 from src.execution.clob_client import CLOBClient
-from src.risk.circuit_breaker import CircuitBreaker
+from src.risk.circuit_breaker import CircuitBreaker, CircuitBreakerConfig
 from src.strategy.value_betting import ValueBettingStrategy
 from src.strategy.event_betting import EventBettingStrategy
 from src.strategy.btc_15m import BTC15mStrategy
@@ -79,7 +79,14 @@ async def run_crypto_strategy(config: AppConfig) -> None:
     bankroll = config.trading.bankroll  # Now configurable from YAML
 
     # Circuit breaker MUST use same starting capital as Portfolio!
-    circuit_breaker = CircuitBreaker(starting_capital=bankroll)
+    cb_config = CircuitBreakerConfig(
+        daily_loss_soft_pct=config.risk.daily_loss_soft_limit_pct,
+        daily_loss_hard_pct=config.risk.daily_loss_hard_limit_pct,
+        max_drawdown_hard_pct=config.risk.max_drawdown_pct,
+        max_drawdown_soft_pct=config.risk.max_drawdown_pct * 0.8,
+        volatility_hard=config.risk.volatility_pause_threshold,
+    )
+    circuit_breaker = CircuitBreaker(starting_capital=bankroll, config=cb_config)
 
     portfolio = Portfolio(starting_capital=bankroll)
     
@@ -197,8 +204,17 @@ async def run_event_strategy(config: AppConfig) -> None:
     )
 
     # Risk management
+    # Risk management
     bankroll = config.trading.bankroll * 0.5  # Allocate 50% to event markets
-    circuit_breaker = CircuitBreaker(starting_capital=bankroll)
+    
+    cb_config = CircuitBreakerConfig(
+        daily_loss_soft_pct=config.risk.daily_loss_soft_limit_pct,
+        daily_loss_hard_pct=config.risk.daily_loss_hard_limit_pct,
+        max_drawdown_hard_pct=config.risk.max_drawdown_pct,
+        max_drawdown_soft_pct=config.risk.max_drawdown_pct * 0.8,
+        volatility_hard=config.risk.volatility_pause_threshold,
+    )
+    circuit_breaker = CircuitBreaker(starting_capital=bankroll, config=cb_config)
 
     from src.portfolio.tracker import Portfolio
     portfolio = Portfolio(starting_capital=bankroll)
@@ -262,6 +278,9 @@ async def run_btc15m_strategy(config: AppConfig) -> None:
 
     logger.info("Initializing BTC 15m strategy")
     
+    # Initialize OracleFeed for safe price data
+    oracle = OracleFeed()
+    
     rate_limiter = RateLimiter()
     clob_client = CLOBClient(
         dry_run=config.dry_run,
@@ -272,6 +291,7 @@ async def run_btc15m_strategy(config: AppConfig) -> None:
     strategy = BTC15mStrategy(
         config=config,
         clob_client=clob_client,
+        oracle=oracle,
     )
     
     try:
@@ -281,6 +301,8 @@ async def run_btc15m_strategy(config: AppConfig) -> None:
         logger.info("BTC 15m strategy task cancelled")
     except Exception as e:
         logger.exception("BTC 15m strategy crashed", error=str(e))
+    finally:
+        await oracle.close()
 
 
 def parse_args() -> argparse.Namespace:
@@ -359,7 +381,7 @@ async def async_main() -> None:
     from src.api.server import app
     from src.api.state import get_state
 
-    api_config = uvicorn.Config(app, host="127.0.0.1", port=8000, log_level="error")
+    api_config = uvicorn.Config(app, host="127.0.0.1", port=config.observability.metrics_port, log_level="error")
     server = uvicorn.Server(api_config)
     
     # Run API server concurrently with strategy

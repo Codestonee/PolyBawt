@@ -248,11 +248,11 @@ class ToxicityFilter:
     
     def _check_momentum(
         self,
-        recent_price: float,
+        recent_price: float | None,
         current_price: float,
     ) -> ToxicityResult:
         """Check for rapid price movements."""
-        if recent_price <= 0:
+        if recent_price is None or recent_price <= 0:
             return ToxicityResult(is_toxic=False, reason=ToxicityReason.NONE, severity=0)
         
         price_move = abs(current_price - recent_price) / recent_price

@@ -11,6 +11,7 @@ from typing import List, Optional, Tuple
 # Fix imports to match project structure
 from src.execution.clob_client import CLOBClient
 from src.infrastructure.config import AppConfig
+from src.ingestion.oracle_feed import OracleFeed
 
 logger = logging.getLogger("strategy.btc_15m")
 
@@ -23,14 +24,14 @@ class BTC15mStrategy:
     """
     Scalping Strategy for 15-minute BTC markets.
     """
-    def __init__(self, config: AppConfig, clob_client: CLOBClient, risk_gatekeeper=None):
+    def __init__(self, config: AppConfig, clob_client: CLOBClient, oracle: OracleFeed, risk_gatekeeper=None):
         self.config = config
         self.clob = clob_client
+        self.oracle = oracle
         self.risk_gatekeeper = risk_gatekeeper
         self.dry_run = config.dry_run
         
         # Pull config from YAML if available, else defaults
-        # We need to add this section to AppConfig eventually
         self.min_edge = 0.02
         self.max_position_size = 20.0
         self.running = False
@@ -50,32 +51,12 @@ class BTC15mStrategy:
         logger.info("BTC 15m Strategy Stopping.")
 
     async def get_btc_price(self) -> float:
-        timeout = aiohttp.ClientTimeout(total=5)
-        
-        # 1. Binance (Primary)
-        try:
-            url = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        return float(data['price'])
-        except Exception as e:
-            logger.warning(f"Oracle Fail (Binance): {e}")
-
-        # 2. Coinbase (Backup)
-        try:
-            url = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        price = float(data['data']['amount'])
-                        return price
-        except Exception as e:
-            logger.warning(f"Oracle Fail (Coinbase): {e}")
-
-        return 0.0
+        """Fetch BTC price from robust OracleFeed."""
+        price = await self.oracle.get_price("BTC")
+        if price is None:
+            logger.warning("Oracle failed to provide BTC price")
+            return 0.0
+        return price
 
     async def fetch_markets_direct(self) -> List[dict]:
         """
@@ -124,6 +105,20 @@ class BTC15mStrategy:
         d2 = (math.log(spot / strike) - 0.5 * vol**2 * time_remaining_years) / (vol * math.sqrt(time_remaining_years))
         prob_above = self.norm_cdf(d2)
         return prob_above if direction == "above" else (1.0 - prob_above)
+        
+    def calculate_fees(self, probability: float) -> float:
+        """
+        Calculate expected taker fee based on probability.
+        Fees are highest near 50% ($0.03+) and lower at extremes.
+        """
+        # Approximating fee structure: ~2% base + variance multiplier
+        # 0.5 prob -> highest variance (0.25) -> max fee
+        variance = probability * (1 - probability)
+        # Empirical fee model: Base 1% + 8% * Variance
+        # p=0.5 -> 1% + 8%*0.25 = 3%
+        # p=0.1 -> 1% + 8%*0.09 = 1.72%
+        fee_pct = 0.01 + (0.08 * variance)
+        return fee_pct
 
     async def scan_and_execute(self):
         if not self.running: return
@@ -178,11 +173,18 @@ class BTC15mStrategy:
 
         if not token_id or curr_yes_price <= 0: return
 
-        edge = my_prob - curr_yes_price
+        # FEE ADJUSTMENT: Calculate net edge
+        est_fee = self.calculate_fees(my_prob)
+        gross_edge = my_prob - curr_yes_price
+        
+        # We pay fees on entry (taker), so cost is price + fee
+        # But fee is subtracted from payout in some models, here we assume entry cost
+        # Net Edge = Prob - (Price + Fee)
+        net_edge = gross_edge - est_fee
 
-        if edge > self.min_edge:
-            logger.info(f"OPPORTUNITY: {question} | Edge: {edge:.4f}")
-            await self.execute_trade(token_id, curr_yes_price, question, edge)
+        if net_edge > self.min_edge:
+            logger.info(f"OPPORTUNITY: {question} | Net Edge: {net_edge:.4f} (Gross: {gross_edge:.4f}, Fee: {est_fee:.4f})")
+            await self.execute_trade(token_id, curr_yes_price, question, net_edge)
 
     async def execute_trade(self, token_id, price, question: str, edge: float):
         size_usd = 10.0 # Hardcoded safe size for now

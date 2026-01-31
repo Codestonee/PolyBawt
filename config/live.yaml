@@ -52,7 +52,7 @@ trading:
 risk:
   daily_loss_soft_limit_pct: 0.03  # 3% soft stop
   daily_loss_hard_limit_pct: 0.05  # 5% hard stop
-  max_drawdown_pct: 0.10          # 10% max drawdown
+  max_drawdown_pct: 0.50          # 50% max drawdown (Emergency Stop)
   volatility_pause_threshold: 2.0
   correlation_reduction_threshold: 0.8
 
@@ -124,7 +124,7 @@ obi:
 # BTC 15m Strategy - DISABLED (Integrated but off)
 # -----------------------------------------------------------------------------
 btc_15m:
-  enabled: false
+  enabled: true
   min_edge: 0.02
   max_position_size: 20.0
 
@@ -146,7 +146,7 @@ models:
 observability:
   log_level: INFO
   log_format: clean
-  metrics_port: 9090
+  metrics_port: 9093
   telegram_enabled: false
 
 # -----------------------------------------------------------------------------

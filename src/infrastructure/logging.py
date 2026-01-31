@@ -255,7 +255,7 @@ class CleanConsoleRenderer:
 
         elif "API Server starting" in event:
             emoji = self.EMOJIS["api"]
-            message = "Dashboard API is online at http://localhost:8000"
+            message = "Dashboard API is online"
 
         elif "ARBITRAGE" in event:
             emoji = self.EMOJIS["arbitrage"]

@@ -65,7 +65,7 @@ class TradeSignal:
     
     @property
     def is_actionable(self) -> bool:
-        return self.passes_gate and self.kelly_size > 0
+        return self.passes_gate and self.kelly_size is not None and self.kelly_size > 0
 
 
 @dataclass
@@ -399,7 +399,7 @@ class ValueBettingStrategy:
             seconds_since_open=market.seconds_since_open,  # FIX #9: Now populated from market
             spread=spread,  # FIX #3: Real spread from order book
             book_depth_usd=book_depth_usd,  # FIX #3: Real depth from order book
-            oracle_age_seconds=self.oracle.get_cached_price(market.asset).age_seconds if self.oracle.get_cached_price(market.asset) else 0,
+            oracle_age_seconds=self.oracle.get_cached_price(market.asset).age_seconds if self.oracle.get_cached_price(market.asset) is not None else 9999,
             rate_limit_usage_pct=self.rate_limiter.order_usage_pct(),
             trading_halted=not self.circuit_breaker.can_trade(),
             correlation_with_portfolio=self.correlation_matrix.max_correlation_with(
@@ -501,7 +501,7 @@ class ValueBettingStrategy:
         # Global exposure cap (safety): do not exceed configured fraction of bankroll.
         max_total = getattr(self.config.trading, "max_total_exposure_pct", 1.0) * self.kelly_sizer.bankroll
         effective = self._effective_exposure_usd()
-        if effective + signal.kelly_size > max_total:
+        if signal.kelly_size is not None and effective + signal.kelly_size > max_total:
             logger.info(
                 "Skipping trade - max total exposure reached",
                 asset=signal.market.asset,
@@ -537,6 +537,9 @@ class ValueBettingStrategy:
         
         # Enforce minimum order size
         min_size = float(getattr(self.config.trading, "min_order_size_usd", 0.0))
+        if signal.kelly_size is None:
+            logger.info("Skipping trade - kelly_size is None")
+            return False
         if min_size > 0 and signal.kelly_size < min_size:
             logger.info("Skipping trade - below minimum order size", size=signal.kelly_size, min_size=min_size)
             return False

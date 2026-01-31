@@ -316,7 +316,7 @@ class NoTradeGate:
             )
         
         # Age of 0 likely means no timestamp was set - treat as stale
-        if ctx.oracle_age_seconds <= 0:
+        if ctx.oracle_age_seconds is not None and ctx.oracle_age_seconds <= 0:
             return (
                 RejectionReason.ORACLE_STALE,
                 f"Oracle age suspicious ({ctx.oracle_age_seconds}s) - may be missing"

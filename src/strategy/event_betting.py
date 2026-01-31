@@ -65,7 +65,7 @@ class EventTradeSignal:
     @property
     def is_actionable(self) -> bool:
         """Can this trade be executed?"""
-        return self.passes_gate and self.kelly_size > 0
+        return self.passes_gate and self.kelly_size is not None and self.kelly_size > 0
     
     @property
     def edge(self) -> float:
@@ -329,7 +329,7 @@ class EventBettingStrategy:
             win_prob=model_prob if ev_result.side == TradeSide.BUY_YES else 1 - model_prob,
             market_price=market.yes_price if ev_result.side == TradeSide.BUY_YES else 1 - market.yes_price,
             side="YES" if ev_result.side == TradeSide.BUY_YES else "NO",
-            current_asset_exposure=self.portfolio.get_exposure_by_asset().get(
+            current_asset_exposure=self.portfolio.get_open_positions().get(
                 market.category.value, 0
             ),
         )
@@ -455,9 +455,9 @@ class EventBettingStrategy:
                 predicted_probability=signal.model_prob,
                 model_name="event_ensemble",
                 features={
-                    "ensemble_weights": signal.ensemble_result.weights_used.__dict__,
-                    "component_probs": signal.ensemble_result.component_probs,
-                    "obi_adjustment": signal.ensemble_result.obi_adjustment,
+                    "ensemble_weights": signal.ensemble_result.weights_used.__dict__ if hasattr(signal.ensemble_result, 'weights_used') else {},
+                    "component_probs": signal.ensemble_result.component_probs if hasattr(signal.ensemble_result, 'component_probs') else {},
+                    "obi_adjustment": signal.ensemble_result.obi_adjustment if hasattr(signal.ensemble_result, 'obi_adjustment') else 0.0,
                 },
                 market_price=signal.market_price,
                 time_to_resolution_hours=signal.market.time_to_resolution,
@@ -484,9 +484,9 @@ class EventBettingStrategy:
         threshold = self.config.event_trading.rebalance_threshold_pct
         
         # Get current positions from portfolio
-        positions = self.portfolio.positions
+        positions = self.portfolio.get_open_positions()
         
-        for position in positions.values():
+        for position in positions:
             # Skip if position doesn't have our metadata
             if not hasattr(position, 'predicted_probability'):
                 continue

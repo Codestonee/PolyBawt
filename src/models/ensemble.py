@@ -286,7 +286,7 @@ class ResearchEnsembleModel:
             spread_bps=orderbook_features.spread_bps if orderbook_features else 50.0,
             depth_usd=orderbook_features.total_depth_100bp if orderbook_features else 1000.0,
             imbalance=orderbook_features.imbalance_100bp if orderbook_features else 0.0,
-            vpin=vpin or 0.0,
+            vpin=getattr(vpin, 'vpin', 0.0) if hasattr(vpin, 'vpin') else (vpin or 0.0),
         )
         
         # Run K-means regime detection
@@ -395,7 +395,9 @@ class ResearchEnsembleModel:
         if orderbook_features:
             # Add VPIN to features if available
             if vpin is not None:
-                orderbook_features.vpin = vpin
+                # vpin might be a VPINResult object or a float
+                vpin_value = getattr(vpin, 'vpin', vpin) if hasattr(vpin, 'vpin') else vpin
+                orderbook_features.vpin = vpin_value
             orderbook_adjustment = self._orderbook.get_probability_adjustment(orderbook_features)
         
         # Detect regime using K-means and get weights
@@ -424,8 +426,9 @@ class ResearchEnsembleModel:
         agreement = max(0.0, 1.0 - variance / 0.25)  # 0-1
         
         # Reduce confidence if VPIN is high (toxic flow)
-        if vpin and vpin > 0.5:
-            agreement *= (1.0 - (vpin - 0.5))
+        vpin_val = getattr(vpin, 'vpin', vpin) if hasattr(vpin, 'vpin') else vpin
+        if vpin_val and vpin_val > 0.5:
+            agreement *= (1.0 - (vpin_val - 0.5))
         
         logger.debug(
             "Ensemble probability calculated",

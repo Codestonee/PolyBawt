@@ -180,6 +180,15 @@ class EventTradingConfig(BaseModel):
     calibration_db_path: str = "data/calibration.db"
 
 
+class BTC15mConfig(BaseModel):
+    """BTC 15m strategy parameters."""
+
+    enabled: bool = False
+    min_edge: float = 0.02
+    max_position_size: float = 20.0
+
+
+
 class ModelsConfig(BaseModel):
     """Model parameters."""
     
@@ -247,6 +256,7 @@ class AppConfig(BaseModel):
     vpin: VPINConfig = Field(default_factory=VPINConfig)
     obi: OBIConfig = Field(default_factory=OBIConfig)
     event_trading: EventTradingConfig = Field(default_factory=EventTradingConfig)
+    btc_15m: BTC15mConfig = Field(default_factory=BTC15mConfig)
 
     @property
     def is_production(self) -> bool:
