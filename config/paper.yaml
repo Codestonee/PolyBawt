@@ -1,60 +1,140 @@
-# Paper Trading Configuration
-# Real market data, no real orders
+# =============================================================================
+# LIVE TRADING CONFIGURATION - REAL MONEY
+# =============================================================================
+#
+# RESEARCH-OPTIMIZED SETTINGS based on:
+# - arXiv:2510.15205 (Polymarket market microstructure)
+# - Claude/Perplexity/Grok research synthesis (2026)
+#
+# Key principles:
+# - Quarter Kelly (0.25) for ~50% of optimal growth with significantly less drawdown
+# - 4% minimum edge after fees (Polymarket fee ~2% at p=0.5)
+# - Conservative risk limits to survive variance
+# - Diversification across BTC/ETH/SOL/XRP with correlation adjustments
+#
+# =============================================================================
 
-environment: paper
+environment: live
 
+# -----------------------------------------------------------------------------
+# API Endpoints
+# -----------------------------------------------------------------------------
 api:
   clob_base_url: "https://clob.polymarket.com"
   gamma_base_url: "https://gamma-api.polymarket.com"
   ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
   polygon_chain_id: 137
 
+# -----------------------------------------------------------------------------
+# Trading Parameters
+# -----------------------------------------------------------------------------
 trading:
+  # Assets to trade (research: XRP provides best diversification)
   assets: [BTC, ETH, SOL, XRP]
-  min_edge_threshold: 0.04
-  kelly_fraction: 0.25
-  max_position_pct: 0.02
-  max_asset_exposure_pct: 0.05
-  cutoff_seconds: 60
-  min_seconds_after_open: 30
-  # Favorite fallback betting
-  favorite_bet_enabled: true
-  favorite_bet_size: 2.00 # USD - bet on favorite if no edge found
-  # Arbitrage trading
-  arbitrage_enabled: true
-  arbitrage_min_profit_pct: 0.005 # 0.5% minimum profit to execute
-  arbitrage_max_size: 50.00 # Max USD per arb trade
 
+  # Starting bankroll - UPDATE THIS to your actual balance
+  bankroll: 72.08
+
+  # Minimum edge required after fees
+  # Research (claude.md): "Fee at p=0.5 is ~3.125%, so 4% edge is minimum for profit"
+  min_edge_threshold: 0.04 # 4% - conservative, ensures profit after fees
+
+  # Kelly fraction for position sizing
+  # Research: "Half-Kelly (0.5x) captures ~75% of optimal growth with ~50% less drawdown"
+  # Research: "Professional money managers typically use 0.10-0.15x Kelly"
+  # Using 0.25 (Quarter Kelly) as balanced approach
+  kelly_fraction: 0.25
+
+  # Maximum position size as % of bankroll
+  # Research: "2% per trade" is standard risk management
+  max_position_pct: 0.03 # 3% per trade ($2.16 at current bankroll)
+
+  # Maximum exposure to any single asset
+  # Research: "Sum correlated positions against total Kelly allocation"
+  max_asset_exposure_pct: 0.08 # 8% per asset ($5.77)
+
+  # Timing constraints
+  cutoff_seconds: 60 # Stop trading 60s before expiry
+  min_seconds_after_open: 30 # Avoid opening volatility (first 30s)
+
+  # Favorite Fallback Betting
+  # When no value edge found, bet small on favorite to maintain participation
+  favorite_bet_enabled: true
+  favorite_bet_size: 5.00 # $5 USD - Polymarket minimum order size
+
+  # Arbitrage Trading
+  # Research: "YES + NO < 1.0 guarantees profit"
+  arbitrage_enabled: true
+  arbitrage_min_profit_pct: 0.005 # 0.5% minimum profit after fees
+  arbitrage_max_size: 10.00 # $10 max per arb (conservative)
+
+# -----------------------------------------------------------------------------
+# Risk Management
+# -----------------------------------------------------------------------------
 risk:
-  daily_loss_soft_limit_pct: 0.03
-  daily_loss_hard_limit_pct: 0.05
-  max_drawdown_pct: 0.10
+  # Daily loss limits
+  # Research: "3% daily loss pause, 5% daily loss halt"
+  daily_loss_soft_limit_pct: 0.03 # 3% - pause new entries ($2.16)
+  daily_loss_hard_limit_pct: 0.05 # 5% - halt all trading ($3.60)
+
+  # Maximum drawdown kill switch
+  # Research: "10% kill switch" is standard for aggressive strategies
+  max_drawdown_pct: 0.10 # 10% - emergency halt ($7.21)
+
+  # Volatility threshold (annualized)
+  # Pause if market vol exceeds 2x normal
   volatility_pause_threshold: 2.0
+
+  # Correlation-based position reduction
+  # Research: "Reduce aggregate exposure when correlations spike during market stress"
   correlation_reduction_threshold: 0.8
 
+# -----------------------------------------------------------------------------
+# Execution Parameters
+# -----------------------------------------------------------------------------
 execution:
-  rate_limit_buffer_pct: 0.10
+  # Rate limit safety buffer
+  rate_limit_buffer_pct: 0.15 # 15% buffer from API limits
+
+  # WebSocket reconnection (exponential backoff)
   ws_reconnect_initial_ms: 100
   ws_reconnect_max_ms: 5000
   ws_reconnect_multiplier: 2.0
   ws_reconnect_jitter: 0.2
-  order_timeout_ms: 5000
+
+  # Order management
+  order_timeout_ms: 5000 # 5s timeout for order submission
   max_retries: 3
 
+# -----------------------------------------------------------------------------
+# Model Parameters
+# -----------------------------------------------------------------------------
 models:
-  jump_intensity_per_day: 2.0
-  jump_size_std: 0.02
+  # Jump-Diffusion parameters
+  # Research: "Calibrate jump parameters daily - they change more slowly"
+  jump_intensity_per_day: 2.0 # ~2 jumps per day typical for crypto
+  jump_size_std: 0.02 # 2% typical jump size
+
+  # Default annualized volatility by asset
+  # Research: "Use 45-60 day rolling windows for daily volatility"
+  # These are baseline values; real-time calibration updates them
   default_volatility:
-    BTC: 0.60
-    ETH: 0.70
-    SOL: 0.85
-    XRP: 0.90
+    BTC: 0.60 # ~60% annual vol (most liquid, lowest)
+    ETH: 0.70 # ~70% annual vol
+    SOL: 0.85 # ~85% annual vol (higher beta)
+    XRP: 0.90 # ~90% annual vol (most volatile)
 
+# -----------------------------------------------------------------------------
+# Observability
+# -----------------------------------------------------------------------------
 observability:
-  log_level: DEBUG
-  log_format: text
-  metrics_port: 9090
-  telegram_enabled: false
+  log_level: INFO # INFO for live (not DEBUG - too verbose)
+  log_format: clean # Clean emoji-based logs for terminal monitoring
+  metrics_port: 9090 # Prometheus metrics endpoint
+  telegram_enabled: false # Enable for alerts (requires secrets)
 
-# Paper trading - no real orders
-dry_run: true
+# -----------------------------------------------------------------------------
+# LIVE TRADING FLAG
+# -----------------------------------------------------------------------------
+# CRITICAL: This enables real order submission
+dry_run: false

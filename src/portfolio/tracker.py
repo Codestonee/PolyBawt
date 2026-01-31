@@ -145,11 +145,21 @@ class Portfolio:
         self.starting_capital = starting_capital
         self.current_capital = starting_capital
         self.peak_capital = starting_capital
-        
+
         self._positions: dict[str, Position] = {}
         self._closed_positions: list[Position] = []
         self._daily: dict[str, DailyPerformance] = {}
-        
+
+        # All-time win/loss tracking
+        self.total_wins: int = 0
+        self.total_losses: int = 0
+        self.total_trades: int = 0
+        self.biggest_win: float = 0.0
+        self.biggest_loss: float = 0.0
+        self._current_streak: int = 0  # positive = wins, negative = losses
+        self.max_consecutive_wins: int = 0
+        self.max_consecutive_losses: int = 0
+
         # Initialize today
         self._ensure_daily(self._today())
     
@@ -249,19 +259,42 @@ class Portfolio:
         daily = self._ensure_daily(self._today())
         daily.realized_pnl += pnl
         daily.trades_exited += 1
+
+        # Update all-time tracking
+        self.total_trades += 1
         if pnl >= 0:
             daily.win_count += 1
+            self.total_wins += 1
+            self.biggest_win = max(self.biggest_win, pnl)
+            # Update streak
+            if self._current_streak >= 0:
+                self._current_streak += 1
+            else:
+                self._current_streak = 1
+            self.max_consecutive_wins = max(self.max_consecutive_wins, self._current_streak)
         else:
             daily.loss_count += 1
-        
+            self.total_losses += 1
+            self.biggest_loss = min(self.biggest_loss, pnl)
+            # Update streak
+            if self._current_streak <= 0:
+                self._current_streak -= 1
+            else:
+                self._current_streak = -1
+            self.max_consecutive_losses = max(self.max_consecutive_losses, abs(self._current_streak))
+
         logger.info(
             "Position settled",
             token_id=token_id,
             outcome="YES" if outcome else "NO",
             pnl=pnl,
             capital=self.current_capital,
+            win_rate=f"{self.win_rate * 100:.1f}%",
         )
         
+        # PERSISTENCE: Save state after every settlement
+        self.save_state()
+
         return pnl
     
     def unrealized_pnl(self, current_prices: dict[str, float]) -> float:
@@ -306,6 +339,43 @@ class Portfolio:
         if self.peak_capital == 0:
             return 0
         return (self.peak_capital - self.current_capital) / self.peak_capital
+
+    @property
+    def win_rate(self) -> float:
+        """All-time win rate as a decimal (0.0 to 1.0)."""
+        if self.total_trades == 0:
+            return 0.0
+        return self.total_wins / self.total_trades
+
+    @property
+    def current_streak(self) -> int:
+        """Current win/loss streak. Positive = wins, negative = losses."""
+        return self._current_streak
+
+    @property
+    def average_win(self) -> float:
+        """Average profit on winning trades."""
+        if self.total_wins == 0:
+            return 0.0
+        wins = [p.realized_pnl for p in self._closed_positions if p.realized_pnl >= 0]
+        return sum(wins) / len(wins) if wins else 0.0
+
+    @property
+    def average_loss(self) -> float:
+        """Average loss on losing trades (returns negative value)."""
+        if self.total_losses == 0:
+            return 0.0
+        losses = [p.realized_pnl for p in self._closed_positions if p.realized_pnl < 0]
+        return sum(losses) / len(losses) if losses else 0.0
+
+    @property
+    def profit_factor(self) -> float:
+        """Ratio of gross profit to gross loss. >1 is profitable."""
+        gross_profit = sum(p.realized_pnl for p in self._closed_positions if p.realized_pnl >= 0)
+        gross_loss = abs(sum(p.realized_pnl for p in self._closed_positions if p.realized_pnl < 0))
+        if gross_loss == 0:
+            return float("inf") if gross_profit > 0 else 0.0
+        return gross_profit / gross_loss
     
     def get_daily_performance(self, date: str | None = None) -> DailyPerformance:
         if date is None:
@@ -327,4 +397,86 @@ class Portfolio:
             "daily_pnl": round(daily.total_pnl, 2),
             "daily_return_pct": round(daily.return_pct * 100, 2),
             "daily_win_rate": round(daily.win_rate * 100, 1),
+            # All-time win rate stats
+            "total_trades": self.total_trades,
+            "total_wins": self.total_wins,
+            "total_losses": self.total_losses,
+            "win_rate": round(self.win_rate * 100, 1),
+            "current_streak": self.current_streak,
+            "max_consecutive_wins": self.max_consecutive_wins,
+            "max_consecutive_losses": self.max_consecutive_losses,
+            "biggest_win": round(self.biggest_win, 2),
+            "biggest_loss": round(self.biggest_loss, 2),
+            "average_win": round(self.average_win, 2),
+            "average_loss": round(self.average_loss, 2),
+            "profit_factor": round(self.profit_factor, 2) if self.profit_factor != float("inf") else "inf",
         }
+
+    def save_state(self, filepath: str = "data/portfolio_state.json") -> None:
+        """Save portfolio state to disk atomically."""
+        import json
+        import os
+        from pathlib import Path
+        
+        try:
+            path = Path(filepath)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            
+            data = {
+                "current_capital": self.current_capital,
+                "peak_capital": self.peak_capital,
+                "total_trades": self.total_trades,
+                "total_wins": self.total_wins,
+                "total_losses": self.total_losses,
+                "biggest_win": self.biggest_win,
+                "biggest_loss": self.biggest_loss,
+                "current_streak": self._current_streak,
+                "max_consecutive_wins": self.max_consecutive_wins,
+                "max_consecutive_losses": self.max_consecutive_losses,
+                "saved_at": datetime.now(timezone.utc).isoformat(),
+                # Note: We don't save open positions as they might desync from chain
+                # We start fresh with positions but keep PnL history
+            }
+            
+            # Atomic write: write to temp file, then rename
+            temp_path = path.with_suffix('.tmp')
+            with open(temp_path, "w") as f:
+                json.dump(data, f, indent=2)
+                f.flush()  # Ensure data is written to disk
+                os.fsync(f.fileno())  # Force OS to flush to disk
+            
+            # Atomic rename (POSIX guaranteed atomic)
+            temp_path.replace(path)
+            
+            logger.debug("Portfolio state saved atomically", path=str(filepath))
+                
+        except Exception as e:
+            logger.error("Failed to save portfolio state", error=str(e))
+
+    def load_state(self, filepath: str = "data/portfolio_state.json") -> None:
+        """Load portfolio state from disk."""
+        import json
+        import os
+        
+        if not os.path.exists(filepath):
+            return
+            
+        try:
+            with open(filepath, "r") as f:
+                data = json.load(f)
+                
+            self.current_capital = data.get("current_capital", self.current_capital)
+            self.peak_capital = data.get("peak_capital", self.peak_capital)
+            self.total_trades = data.get("total_trades", 0)
+            self.total_wins = data.get("total_wins", 0)
+            self.total_losses = data.get("total_losses", 0)
+            self.biggest_win = data.get("biggest_win", 0.0)
+            self.biggest_loss = data.get("biggest_loss", 0.0)
+            self._current_streak = data.get("current_streak", 0)
+            self.max_consecutive_wins = data.get("max_consecutive_wins", 0)
+            self.max_consecutive_losses = data.get("max_consecutive_losses", 0)
+            
+            logger.info("Portfolio state loaded", trades=self.total_trades, capital=self.current_capital)
+            
+        except Exception as e:
+            logger.error("Failed to load portfolio state", error=str(e))

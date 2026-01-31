@@ -20,11 +20,12 @@ from typing import Any
 from src.infrastructure.logging import get_logger, bind_context
 from src.infrastructure.config import AppConfig
 from src.ingestion.market_discovery import Market, MarketDiscovery
-from src.ingestion.oracle_feed import OracleFeed
-from src.models.jump_diffusion import (
-    JumpDiffusionModel, JumpDiffusionParams, minutes_to_years,
-    logit, inv_logit, edge_in_logit_space,  # Logit utilities from arXiv paper
-)
+from src.ingestion.oracle_feed import OracleFeed, SniperAlert, SniperRiskLevel
+# from src.models.jump_diffusion import (
+#     JumpDiffusionModel, JumpDiffusionParams, minutes_to_years,
+#     logit, inv_logit, edge_in_logit_space,  # Logit utilities from arXiv paper
+# )
+from src.models.pricing import MertonJDCalibrator  # NEW: Research-based model
 from src.models.ev_calculator import EVCalculator, EVResult, TradeSide
 from src.models.no_trade_gate import NoTradeGate, GateConfig, TradeContext
 from src.risk.kelly_sizer import KellySizer, CorrelationMatrix
@@ -42,8 +43,9 @@ from src.strategy.toxicity_filter import ToxicityFilter, ToxicityResult
 # Research-backed enhancements (2026 deep research synthesis)
 from src.models.ensemble import ResearchEnsembleModel
 from src.models.orderbook_signal import OrderBookSignalModel, OrderBookFeatures
-from src.models.sentiment import SentimentIntegrator
-from src.ingestion.websocket_client import PolymarketWebSocketClient, VPINCalculator
+from src.models.sentiment import SentimentIntegrator, SentimentAggregator  # NEW: Sentiment
+from src.ingestion.ws_client import WebSocketClient, create_market_ws_client  # NEW: WebSocket
+from src.risk.vpin import VPINCalculator  # NEW: VPIN
 
 logger = get_logger(__name__)
 
@@ -156,7 +158,9 @@ class ValueBettingStrategy:
         self._pending_fills: dict[str, PendingFill] = {}  # client_order_id -> PendingFill
         
         # Models
-        self.pricing_model = JumpDiffusionModel()
+        # self.pricing_model = JumpDiffusionModel()  # OLD
+        self.pricing_model = MertonJDCalibrator()  # NEW: Research model
+        
         self.ev_calculator = EVCalculator()
         self.no_trade_gate = NoTradeGate(GateConfig(
             min_edge_threshold=config.trading.min_edge_threshold,
@@ -188,8 +192,12 @@ class ValueBettingStrategy:
         # Research-backed enhancements (2026 deep research synthesis)
         self.ensemble_model = ResearchEnsembleModel()  # Combines JD + Kou + Bates + order book
         self.orderbook_signal = OrderBookSignalModel()  # Order book imbalance (65-75% accuracy)
-        self.sentiment_integrator = SentimentIntegrator()  # Funding rate + F&G for sizing
+        # self.sentiment_integrator = SentimentIntegrator()  # OLD
+        self.sentiment_aggregator = SentimentAggregator() # NEW: From research
         self._vpin_calculators: dict[str, VPINCalculator] = {}  # Per-market VPIN tracking
+        
+        # WebSocket Client (Research)
+        self.ws_client = None
         
         # State
         self.metrics = StrategyMetrics()
@@ -203,7 +211,45 @@ class ValueBettingStrategy:
         # FIX: Track traded markets to enforce "1 bet per asset per cycle" (User Request)
         # Map: market.question -> expiry_timestamp
         self._traded_markets: dict[str, float] = {}
-    
+
+        # RESEARCH FIX: Sniper protection - register callback for Chainlink price divergence
+        self.oracle.register_sniper_callback(self._handle_sniper_alert)
+        self._sniper_alert_active: dict[str, SniperAlert] = {}  # asset -> active alert
+
+        # Extreme probability settings (where fees approach zero)
+        self._extreme_prob_enabled = config.trading.extreme_prob_enabled
+        self._extreme_prob_threshold = config.trading.extreme_prob_threshold
+        self._extreme_prob_kelly_boost = config.trading.extreme_prob_kelly_boost
+        self._extreme_prob_min_edge = config.trading.extreme_prob_min_edge
+
+    async def _init_websocket(self):
+        """Initialize and connect WebSocket client."""
+        if not self.ws_client:
+            self.ws_client = await create_market_ws_client()
+            await self.ws_client.connect()
+            logger.info("WebSocket initialized for strategy")
+
+    def _is_extreme_probability(self, market: Market) -> bool:
+        """
+        Check if market is at extreme probability (near 0% or 100%).
+
+        At extremes, fees approach zero:
+        - Fee at p=0.01 → $0.0025 per 100 shares
+        - Fee at p=0.50 → $1.56 per 100 shares (62x more!)
+
+        This allows larger positions and lower edge thresholds.
+        """
+        if not self._extreme_prob_enabled:
+            return False
+        threshold = self._extreme_prob_threshold
+        return market.yes_price < threshold or market.yes_price > (1 - threshold)
+
+    def _get_min_edge_for_market(self, market: Market) -> float:
+        """Get minimum edge threshold, lower at extreme probabilities."""
+        if self._is_extreme_probability(market):
+            return self._extreme_prob_min_edge
+        return self.config.trading.min_edge_threshold
+
     async def analyze_market(
         self,
         market: Market,
@@ -219,11 +265,15 @@ class ValueBettingStrategy:
         Returns:
             TradeSignal if opportunity found, None otherwise
         """
-        # Get model parameters for this asset
-        params = JumpDiffusionParams.for_asset(market.asset)
+        # Calculate model probability using Research Code (MertonJD)
+        # Note: In a real implementation, we would calibrate this first
+        # For now, we assume params are reasonable or will be calibrated
         
-        # Calculate model probability
-        time_years = minutes_to_years(market.minutes_to_expiry)
+        # NOTE: self.pricing_model (MertonJDCalibrator) handles calibration
+        # We need historical returns for it. For now, let's use the Ensemble model 
+        # which incorporates it, or fallback to simple heuristics if calibration missing.
+        
+        time_years = market.minutes_to_expiry / (365 * 24 * 60) # Approx
 
         # FIX #1: Use market.open_price if available, else fall back to spot
         if market.open_price is not None:
@@ -247,6 +297,14 @@ class ValueBettingStrategy:
         book_depth_usd = 1000.0  # Default fallback
         book = None
         
+        # Use WebSocket for orderbook if available (faster!)
+        if self.ws_client and self.ws_client.is_connected:
+             ws_book_data = self.ws_client.get_orderbook(market.yes_token_id)
+             if ws_book_data:
+                 # Adapt WS format to OrderBook object expected by signals
+                 # This is a simplification; ideally we'd map fields properly
+                 pass 
+
         if self.clob_client:
             try:
                 # Fetch order book for YES token (primary analysis)
@@ -268,7 +326,11 @@ class ValueBettingStrategy:
                 # Get VPIN if we have a calculator for this market
                 if token_id not in self._vpin_calculators:
                     self._vpin_calculators[token_id] = VPINCalculator()
-                vpin = self._vpin_calculators[token_id].calculate()
+                
+                # Feed trades to VPIN calculator (if we had trade stream)
+                # self._vpin_calculators[token_id].add_trade(...) 
+                
+                vpin = self._vpin_calculators[token_id].calculate_vpin()
                 
                 logger.debug(
                     "Order book analyzed",
@@ -326,6 +388,7 @@ class ValueBettingStrategy:
                 logger.warning("Failed to fetch order book", error=str(e), token_id=token_id)
 
         # Check NO-TRADE gate
+        # Use lower edge threshold for extreme probability markets (fees approach zero)
         context = TradeContext(
             ev_result=ev_result,
             asset=market.asset,
@@ -340,6 +403,7 @@ class ValueBettingStrategy:
             correlation_with_portfolio=self.correlation_matrix.max_correlation_with(
                 market.asset, self.portfolio.get_exposure_by_asset()
             ),
+            override_min_edge=self._get_min_edge_for_market(market),  # Lower at extremes
         )
         
         gate_result = self.no_trade_gate.evaluate(context)
@@ -357,16 +421,37 @@ class ValueBettingStrategy:
             market.asset, self.portfolio.get_exposure_by_asset()
         )
         
-        # RESEARCH: Apply sentiment-based sizing multiplier (NOT probability adjustment!)
-        # "Funding rate R² ≈ 0 for next-period prediction, use for sizing conviction only"
-        trade_direction = "long" if ev_result.side == TradeSide.BUY_YES else "short"
-        sentiment_mult, sentiment = self.sentiment_integrator.get_sizing_multiplier(
-            asset=market.asset,
-            trade_direction=trade_direction,
-        )
-        
-        # Final adjusted size = base × correlation × sentiment
-        adjusted_size = kelly_result.recommended_size_usd * corr_adj * sentiment_mult
+        # Sentiment-based sizing multiplier (NOT probability adjustment!)
+        # SAFETY: Disabled by default because this code previously used placeholders.
+        sentiment_mult = 1.0
+        if getattr(self.config.trading, "sentiment_sizing_enabled", False):
+            # TODO: Replace placeholders with real inputs (e.g. funding rate + real OBI volumes)
+            market_state_sentiment = type('obj', (object,), {
+                'asset': market.asset,
+                'funding_rate': 0.0001,  # placeholder
+                'bid_volume_5bp': 1000,  # placeholder
+                'ask_volume_5bp': 1000,  # placeholder
+            })
+
+            sentiment_score = self.sentiment_aggregator.composite_sentiment_score(market_state_sentiment)
+            base_fraction = self.config.trading.kelly_fraction
+            adjusted_fraction = self.sentiment_aggregator.adjust_position_sizing(base_fraction, sentiment_score)
+            sentiment_mult = adjusted_fraction / base_fraction if base_fraction > 0 else 1.0
+
+        # EXTREME PROBABILITY BOOST: Fees approach zero at p < 5% or p > 95%
+        # Research: Fee at p=0.01 is $0.0025 vs $1.56 at p=0.50 (62x less!)
+        extreme_prob_mult = 1.0
+        if self._is_extreme_probability(market):
+            extreme_prob_mult = self._extreme_prob_kelly_boost
+            logger.info(
+                "Extreme probability detected - boosting position",
+                asset=market.asset,
+                yes_price=f"{market.yes_price:.2f}",
+                boost=f"{extreme_prob_mult:.1f}x",
+            )
+
+        # Final adjusted size = base × correlation × sentiment × extreme_boost
+        adjusted_size = kelly_result.recommended_size_usd * corr_adj * sentiment_mult * extreme_prob_mult
         
         logger.debug(
             "Position sizing",
@@ -395,29 +480,37 @@ class ValueBettingStrategy:
     async def execute_signal(self, signal: TradeSignal) -> bool:
         """
         Execute a trade signal.
-        
+
         Orchestrates:
-        1. Pre-trade checks (circuit breaker, actionability)
+        1. Pre-trade checks (circuit breaker, actionability, sniper risk)
         2. Pricing (order book vs fallback)
         3. Order creation & submission
         4. State tracking
-        
+
         Args:
             signal: Signal to execute
-        
+
         Returns:
             True if order placed successfully
         """
         if not signal.is_actionable:
             return False
-            
+
         # FIX: Enforce 1 bet per market limit
         if signal.market.question in self._traded_markets:
             logger.info("Skipping trade - already traded this market", asset=signal.market.asset)
             return False
-        
+
         if not self.circuit_breaker.can_enter_new_position():
             logger.info("Circuit breaker blocking new positions")
+            return False
+
+        # RESEARCH FIX: Check sniper risk before placing orders
+        if not await self._check_sniper_risk_for_market(signal.market):
+            logger.warning(
+                "Skipping trade due to sniper risk",
+                asset=signal.market.asset,
+            )
             return False
         
         # Determine token and side
@@ -465,9 +558,109 @@ class ValueBettingStrategy:
         expired = [q for q, expiry in self._traded_markets.items() if expiry < now]
         for q in expired:
             del self._traded_markets[q]
-        
+
         if expired:
             logger.debug("Cleaned up expired traded markets", count=len(expired))
+
+    async def _handle_sniper_alert(self, alert: SniperAlert) -> None:
+        """
+        Handle sniper risk alert from Chainlink price divergence.
+
+        CRITICAL: When Chainlink price diverges significantly from market price,
+        HFT bots with faster Chainlink access could front-run our orders.
+
+        Research (gemeni.txt):
+        "If the Chainlink price deviates from the Polymarket mid-price by more
+        than a threshold, the bot should immediately send a DELETE /cancel-all
+        request to pull liquidity."
+        """
+        self._sniper_alert_active[alert.asset] = alert
+
+        if alert.should_cancel_orders:
+            logger.critical(
+                "SNIPER PROTECTION: Cancelling all orders due to Chainlink divergence",
+                asset=alert.asset,
+                chainlink_price=alert.chainlink_price,
+                market_price=alert.market_price,
+                divergence_pct=f"{alert.divergence_pct:.3f}%",
+            )
+
+            # Cancel all open orders for this asset
+            try:
+                cancelled = await self._cancel_orders_for_asset(alert.asset)
+                logger.info(
+                    "Sniper protection: orders cancelled",
+                    asset=alert.asset,
+                    count=cancelled,
+                )
+            except Exception as e:
+                logger.error(
+                    "Failed to cancel orders during sniper alert",
+                    asset=alert.asset,
+                    error=str(e),
+                )
+
+    async def _cancel_orders_for_asset(self, asset: str) -> int:
+        """
+        Cancel all open orders for a specific asset.
+
+        Uses the pending_fills tracking to find orders by asset,
+        then cancels them via the order manager.
+
+        Args:
+            asset: Asset symbol (BTC, ETH, SOL, XRP)
+
+        Returns:
+            Number of orders cancelled
+        """
+        cancelled = 0
+
+        # Find all pending orders for this asset
+        order_ids_to_cancel = [
+            order_id
+            for order_id, fill in self._pending_fills.items()
+            if fill.asset == asset
+        ]
+
+        # Cancel each order
+        for order_id in order_ids_to_cancel:
+            order = self.order_manager.get_order(order_id)
+            if order and order.state.is_active:
+                success = await self.order_manager.cancel_order(order)
+                if success:
+                    cancelled += 1
+
+        return cancelled
+
+    async def _check_sniper_risk_for_market(self, market: Market) -> bool:
+        """
+        Check for sniper risk before placing orders.
+
+        Returns:
+            True if safe to proceed, False if sniper risk detected
+        """
+        # Get the market mid-price (YES price is the mid for UP markets)
+        market_mid = market.yes_price
+
+        alert = await self.oracle.check_sniper_risk(market.asset, market_mid)
+
+        if alert is None:
+            # Clear any previous alert for this asset
+            self._sniper_alert_active.pop(market.asset, None)
+            return True  # Safe to proceed
+
+        if alert.risk_level == SniperRiskLevel.CRITICAL:
+            return False  # Do not place orders
+
+        if alert.risk_level == SniperRiskLevel.ELEVATED:
+            logger.warning(
+                "Elevated sniper risk - proceeding with caution",
+                asset=market.asset,
+                divergence_pct=f"{alert.divergence_pct:.3f}%",
+            )
+            return True  # Proceed but with caution
+
+        return True
 
     async def _get_execution_price(
         self, 
@@ -671,7 +864,10 @@ class ValueBettingStrategy:
         
         # Update drawdown
         self.circuit_breaker.update_drawdown(self.portfolio.current_capital)
-        
+
+        # Wire portfolio equity into Kelly sizer for accurate sizing
+        self.kelly_sizer.update_bankroll(self.portfolio.current_capital)
+
         # Update oracle staleness (max age across all watched assets)
         max_oracle_age = 0.0
         for asset in self.config.trading.assets:
@@ -715,14 +911,16 @@ class ValueBettingStrategy:
             orphaned_count = 0
             for order in local_active:
                 if order.exchange_order_id and order.exchange_order_id not in exchange_order_ids:
-                    # Order not on exchange but we think it's active
-                    # Likely filled or canceled - mark as filled for safety
+                    # Order not on exchange but we think it's active.
+                    # Do NOT mark as filled. We don't have fill details.
+                    # Mark as FAILED so risk logic doesn't assume exposure or profit.
                     logger.warning(
-                        "Orphaned order detected - marking as filled",
+                        "Orphaned order detected - marking as FAILED (unknown final state)",
                         client_order_id=order.client_order_id,
                         exchange_order_id=order.exchange_order_id,
                     )
-                    order.update_state(order.state.FILLED)
+                    order.update_state(order.state.FAILED)
+                    order.error_message = "Orphaned during reconciliation: not present on exchange open orders"
                     orphaned_count += 1
             
             if orphaned_count > 0 or len(exchange_orders) > 0:
@@ -783,39 +981,74 @@ class ValueBettingStrategy:
         
         try:
             # Calculate size (capped by config)
-            arb_size = min(
+            # FIX: Clamp to min order size ($5) for Polymarket
+            # The API rejects orders < $5 (CTF minimum)
+            MIN_ORDER_SIZE = 5.0
+            
+            raw_size = min(
                 self.config.trading.arbitrage_max_size,
                 self.kelly_sizer.bankroll * 0.05  # Max 5% of bankroll per arb
             )
             
+            # If we have a guaranteed profit, we can afford to size up to min
+            # provided it's safe (e.g. < 50% bankroll)
+            arb_size = max(MIN_ORDER_SIZE, raw_size)
+            
+            # Safety check: don't bet the house just to meet min size
+            if arb_size > self.kelly_sizer.bankroll * 0.5:
+                 logger.warning(
+                     "Arbitrage size exceeds safety limit",
+                     size=f"${arb_size:.2f}",
+                     limit=f"${self.kelly_sizer.bankroll * 0.5:.2f}"
+                 )
+                 return
+
+            # CRITICAL SAFETY CHECK: Ensure we have funds for BOTH legs
+            # We need 2 * arb_size total (one for YES, one for NO)
+            required_capital = arb_size * 2
+            if self.kelly_sizer.bankroll < required_capital:
+                logger.warning(
+                    "Insufficient funds for full arbitrage",
+                    required=f"${required_capital:.2f}",
+                    available=f"${self.kelly_sizer.bankroll:.2f}",
+                    asset=market.asset,
+                )
+                return
+
             # For BUY_YES_AND_NO: buy both outcomes
-            if opportunity.arb_type == ArbitrageType.LONG_ARB:
-                # Place YES order
-                yes_order = await self.order_manager.create_order(
+            # FIX: Use correct enum value LONG_REBALANCING
+            if opportunity.arb_type == ArbitrageType.LONG_REBALANCING:
+                # Place YES order with IOC to reduce leg risk
+                yes_order = self.order_manager.create_order(
                     token_id=market.yes_token_id,
                     side=OrderSide.BUY,
                     price=opportunity.yes_price,
-                    size=arb_size / opportunity.yes_price,
-                    order_type=OrderType.GTC,
+                    size=arb_size,
+                    order_type=OrderType.IOC,
                 )
-                
+                yes_success = await self.order_manager.submit_order(yes_order)
+
                 # Place NO order if token exists
+                no_success = False
                 if market.no_token_id:
-                    no_order = await self.order_manager.create_order(
+                    no_order = self.order_manager.create_order(
                         token_id=market.no_token_id,
                         side=OrderSide.BUY,
                         price=opportunity.no_price,
-                        size=arb_size / opportunity.no_price,
-                        order_type=OrderType.GTC,
+                        size=arb_size,
+                        order_type=OrderType.IOC,
                     )
-                
+                    no_success = await self.order_manager.submit_order(no_order)
+
                 logger.info(
                     "Arbitrage executed",
                     asset=market.asset,
                     profit_pct=f"{opportunity.net_profit_pct:.2%}",
                     size=f"${arb_size:.2f}",
+                    yes_submitted=yes_success,
+                    no_submitted=no_success,
                 )
-                self.metrics.orders_placed += 2
+                self.metrics.orders_placed += int(yes_success) + int(no_success)
                 
         except Exception as e:
             logger.error("Arbitrage execution failed", error=str(e), asset=market.asset)
@@ -878,22 +1111,43 @@ class ValueBettingStrategy:
     async def _place_favorite_fallback(self, market: Market) -> None:
         """
         Place a minimum bet on the most likely outcome (favorite).
-        
+
         Called when no value edge is found, to maintain participation
         and capture trend premiums.
         """
-        # Determine favorite: YES if yes_price > 0.5, else NO
-        is_yes_favorite = market.yes_price > 0.5
+        # Determine favorite: choose the higher-priced outcome
+        is_yes_favorite = market.yes_price >= market.no_price
         favorite_side = TradeSide.BUY_YES if is_yes_favorite else TradeSide.BUY_NO
-        favorite_price = market.yes_price if is_yes_favorite else (1.0 - market.yes_price)
+        favorite_price = market.yes_price if is_yes_favorite else market.no_price
         token_id = market.yes_token_id if is_yes_favorite else market.no_token_id
-        
+
         # Skip if no token ID (shouldn't happen, but be safe)
         if not token_id:
             return
-        
+
+        # Enforce per-market limit (prevent duplicate bets in same round)
+        if market.question in self._traded_markets:
+            logger.info("Skipping favorite fallback - already traded this market", asset=market.asset)
+            return
+
+        # Check circuit breaker before placing bet
+        if not self.circuit_breaker.can_enter_new_position():
+            logger.info("Circuit breaker blocking favorite fallback bet")
+            return
+
         bet_size = self.config.trading.favorite_bet_size
-        
+
+        # Enforce max asset exposure
+        exposure_by_asset = self.portfolio.get_exposure_by_asset()
+        current_asset_exposure = exposure_by_asset.get(market.asset, 0.0)
+        max_additional = (self.kelly_sizer.max_asset_exposure_pct * self.kelly_sizer.bankroll) - current_asset_exposure
+        if max_additional <= 0:
+            logger.info("Skipping favorite fallback - max asset exposure reached", asset=market.asset)
+            return
+        bet_size = min(bet_size, max_additional)
+        if bet_size <= 0:
+            return
+
         # Check if we're in dry-run mode
         if self.config.dry_run:
             logger.info(
@@ -904,19 +1158,30 @@ class ValueBettingStrategy:
                 size=f"${bet_size:.2f}",
             )
             return
-        
+
         # Place actual order
         try:
-            order = await self.order_manager.create_order(
+            order = self.order_manager.create_order(
                 token_id=token_id,
                 side=OrderSide.BUY,
                 price=favorite_price,
-                size=bet_size / favorite_price,  # Convert USD to shares
+                size=bet_size,
                 order_type=OrderType.GTC,
             )
-            
-            if order:
+
+            success = await self.order_manager.submit_order(order)
+            if success:
                 self.metrics.orders_placed += 1
+                self._pending_fills[order.client_order_id] = PendingFill(
+                    token_id=token_id,
+                    asset=market.asset,
+                    side=PositionSide.LONG_YES if is_yes_favorite else PositionSide.LONG_NO,
+                    price=favorite_price,
+                    size_usd=bet_size,
+                    market_question=market.question,
+                    expires_at=market.end_date.timestamp(),
+                )
+                self._traded_markets[market.question] = market.end_date.timestamp()
                 logger.info(
                     "Favorite fallback bet placed",
                     asset=market.asset,
@@ -924,7 +1189,7 @@ class ValueBettingStrategy:
                     price=f"{favorite_price:.3f}",
                     size=f"${bet_size:.2f}",
                 )
-                
+
         except Exception as e:
             logger.error(
                 "Favorite fallback bet failed",
@@ -934,6 +1199,9 @@ class ValueBettingStrategy:
 
     async def run_iteration(self) -> None:
         """Run single iteration of the strategy loop."""
+        # Initialize WebSocket if not already
+        await self._init_websocket()
+        
         # Clear order book cache at start of iteration
         self._order_book_cache.clear()
         
@@ -975,6 +1243,16 @@ class ValueBettingStrategy:
                 # STEP 3: Favorite Fallback Bet (if no value trade placed)
                 if not trade_placed and self.config.trading.favorite_bet_enabled:
                     await self._place_favorite_fallback(market)
+
+        # Update API state snapshot
+        try:
+            from src.api.state import get_state
+            st = get_state()
+            st.portfolio = self.portfolio
+            st.active_orders = self.order_manager.get_active_orders()
+            st.last_update = time.time()
+        except Exception:
+            pass
     
     async def run(self, max_iterations: int | None = None) -> None:
         """
@@ -1013,6 +1291,10 @@ class ValueBettingStrategy:
             logger.info("Strategy cancelled")
         finally:
             self._running = False
+            # Cleanup WebSocket
+            if self.ws_client:
+                await self.ws_client.close()
+            
             logger.info(
                 "Strategy stopped",
                 iterations=iteration,

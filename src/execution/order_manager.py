@@ -406,15 +406,46 @@ class OrderManager:
         # Real submission via callback
         if self._submit_callback:
             try:
-                await self._submit_callback(order)
-                order.update_state(OrderState.NEW)
+                # The submit callback may either:
+                # 1) Return a response-like object with .success/.exchange_order_id/.error_message
+                # 2) Mutate the order state directly (legacy behavior)
+                result = await self._submit_callback(order)
+
                 self._pending_orders.discard(order.client_order_id)
+
+                # Prefer interpreting a response object if returned
+                if result is not None and hasattr(result, "success"):
+                    if bool(getattr(result, "success")):
+                        order.exchange_order_id = getattr(result, "exchange_order_id", None) or getattr(result, "orderID", None)
+                        order.update_state(OrderState.NEW)
+                    else:
+                        order.update_state(OrderState.REJECTED)
+                        order.error_message = str(getattr(result, "error_message", ""))
+
+                # If callback didn't set a state (or returned None), default to NEW.
+                if order.state == OrderState.PENDING_NEW:
+                    order.update_state(OrderState.NEW)
+
+                # Persist post-submit state (NEW/REJECTED/FAILED/etc.)
+                if self._persistence:
+                    self._persistence.save_order(order)
+
+                if order.state.is_terminal and order.state not in (OrderState.FILLED, OrderState.CANCELED):
+                    if order.state == OrderState.REJECTED:
+                        self._total_rejected += 1
+                    return False
+
                 self._total_submitted += 1
                 return True
+
             except Exception as e:
                 order.update_state(OrderState.FAILED)
                 order.error_message = str(e)
                 self._pending_orders.discard(order.client_order_id)
+
+                if self._persistence:
+                    self._persistence.save_order(order)
+
                 logger.error(
                     "Order submission failed",
                     client_order_id=order.client_order_id,

@@ -1,34 +1,27 @@
 """
 Circuit breakers for risk management.
-
 Implements automatic trading halts when risk thresholds are breached:
 - Daily loss limits
 - Max drawdown
 - Volatility spikes
 - Oracle staleness
 """
-
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Any
-
 from src.infrastructure.logging import get_logger
 
 logger = get_logger(__name__)
 
-
 class BreakerState(Enum):
     """Circuit breaker state."""
-    
-    CLOSED = "closed"  # Normal operation
-    SOFT_TRIPPED = "soft_tripped"  # Warning, restrictions apply
-    HARD_TRIPPED = "hard_tripped"  # Trading halted
-
+    CLOSED = "closed"           # Normal operation
+    SOFT_TRIPPED = "soft_tripped" # Warning, restrictions apply
+    HARD_TRIPPED = "hard_tripped" # Trading halted
 
 class BreakerType(Enum):
     """Types of circuit breakers."""
-
     DAILY_LOSS = "daily_loss"
     DRAWDOWN = "drawdown"
     VOLATILITY = "volatility"
@@ -37,11 +30,9 @@ class BreakerType(Enum):
     CONSECUTIVE_LOSSES = "consecutive_losses"
     MANUAL = "manual"
 
-
 @dataclass
 class BreakerStatus:
     """Status of a single circuit breaker."""
-    
     breaker_type: BreakerType
     state: BreakerState
     current_value: float
@@ -49,54 +40,52 @@ class BreakerStatus:
     hard_threshold: float
     message: str = ""
     tripped_at: float | None = None
-    
+
     @property
     def is_tripped(self) -> bool:
         return self.state != BreakerState.CLOSED
 
-
 @dataclass
 class CircuitBreakerConfig:
     """Configuration for circuit breakers."""
-
     # Daily loss limits (as % of starting capital)
     daily_loss_soft_pct: float = 0.03  # -3%
     daily_loss_hard_pct: float = 0.05  # -5%
-
+    
     # Drawdown limits
-    max_drawdown_soft_pct: float = 0.07  # -7%
-    max_drawdown_hard_pct: float = 0.10  # -10%
-
+    max_drawdown_soft_pct: float = 0.07 # -7%
+    max_drawdown_hard_pct: float = 0.10 # -10%
+    
     # Volatility thresholds (annualized)
     volatility_soft: float = 1.5  # 150%
     volatility_hard: float = 2.0  # 200%
-
+    
     # Oracle staleness (seconds)
     oracle_stale_soft: float = 15.0
     oracle_stale_hard: float = 30.0
-
+    
     # Rate limit usage
     rate_limit_soft_pct: float = 0.80
     rate_limit_hard_pct: float = 0.95
-
+    
     # Consecutive loss limits
-    consecutive_loss_soft: int = 5   # Soft trip after 5 consecutive losses
-    consecutive_loss_hard: int = 8   # Hard trip after 8 consecutive losses
-
+    consecutive_loss_soft: int = 5  # Soft trip after 5 consecutive losses
+    consecutive_loss_hard: int = 8  # Hard trip after 8 consecutive losses
+    
     # Auto-reset after time (0 = no auto-reset)
     soft_reset_seconds: float = 300   # 5 minutes for soft trips
     hard_reset_seconds: float = 1800  # 30 minutes for hard trips (0 = never)
-
+    
     # Cooldown periods by breaker type (seconds)
+    # -1 means NEVER auto-reset
     breaker_cooldowns: dict[str, float] = field(default_factory=lambda: {
-        "daily_loss": 0,           # Never auto-reset daily loss
-        "drawdown": 0,             # Never auto-reset drawdown
-        "volatility": 300,         # 5 min cooldown
-        "oracle": 60,              # 1 min cooldown
-        "rate_limit": 120,         # 2 min cooldown
+        "daily_loss": -1,       # Never auto-reset daily loss
+        "drawdown": -1,         # Never auto-reset drawdown
+        "volatility": 300,      # 5 min cooldown
+        "oracle": 60,           # 1 min cooldown
+        "rate_limit": 120,      # 2 min cooldown
         "consecutive_losses": 600, # 10 min cooldown
     })
-
 
 class CircuitBreaker:
     """
@@ -117,13 +106,12 @@ class CircuitBreaker:
         # Check before trading
         if breakers.can_trade():
             execute_trade()
-        
+            
         # Get status
         for status in breakers.get_all_status():
             if status.is_tripped:
                 logger.warning(f"{status.breaker_type}: {status.message}")
     """
-    
     def __init__(
         self,
         starting_capital: float,
@@ -131,7 +119,7 @@ class CircuitBreaker:
     ):
         self.starting_capital = starting_capital
         self.config = config or CircuitBreakerConfig()
-
+        
         # Current values
         self._daily_pnl = 0.0
         self._peak_capital = starting_capital
@@ -141,16 +129,16 @@ class CircuitBreaker:
         self._rate_limit_usage = 0.0
         self._consecutive_losses = 0
         self._last_trade_won = True
-
+        
         # Breaker states
         self._states: dict[BreakerType, BreakerState] = {
             bt: BreakerState.CLOSED for bt in BreakerType
         }
         self._trip_times: dict[BreakerType, float] = {}
-
+        
         # Manual override
         self._manual_halt = False
-    
+
     def update_daily_pnl(self, pnl: float) -> None:
         """Update daily PnL and check breaker."""
         self._daily_pnl = pnl
@@ -168,7 +156,7 @@ class CircuitBreaker:
                 self._reset(BreakerType.DAILY_LOSS)
         else:
             self._reset(BreakerType.DAILY_LOSS)
-    
+
     def update_drawdown(self, current_capital: float) -> None:
         """Update capital and check drawdown breaker."""
         self._current_capital = current_capital
@@ -178,14 +166,14 @@ class CircuitBreaker:
             drawdown = (self._peak_capital - current_capital) / self._peak_capital
         else:
             drawdown = 0
-        
+            
         if drawdown >= self.config.max_drawdown_hard_pct:
             self._trip(BreakerType.DRAWDOWN, BreakerState.HARD_TRIPPED)
         elif drawdown >= self.config.max_drawdown_soft_pct:
             self._trip(BreakerType.DRAWDOWN, BreakerState.SOFT_TRIPPED)
         else:
             self._reset(BreakerType.DRAWDOWN)
-    
+
     def update_volatility(self, annualized_vol: float) -> None:
         """Update volatility and check breaker."""
         self._current_volatility = annualized_vol
@@ -196,7 +184,7 @@ class CircuitBreaker:
             self._trip(BreakerType.VOLATILITY, BreakerState.SOFT_TRIPPED)
         else:
             self._reset(BreakerType.VOLATILITY)
-    
+
     def update_oracle_age(self, age_seconds: float) -> None:
         """Update oracle staleness and check breaker."""
         self._oracle_age = age_seconds
@@ -207,11 +195,11 @@ class CircuitBreaker:
             self._trip(BreakerType.ORACLE, BreakerState.SOFT_TRIPPED)
         else:
             self._reset(BreakerType.ORACLE)
-    
+
     def update_rate_limit_usage(self, usage_pct: float) -> None:
         """Update rate limit usage and check breaker."""
         self._rate_limit_usage = usage_pct
-
+        
         if usage_pct >= self.config.rate_limit_hard_pct:
             self._trip(BreakerType.RATE_LIMIT, BreakerState.HARD_TRIPPED)
         elif usage_pct >= self.config.rate_limit_soft_pct:
@@ -222,12 +210,11 @@ class CircuitBreaker:
     def record_trade_result(self, won: bool) -> None:
         """
         Record a trade result to track consecutive losses.
-
         Args:
             won: True if the trade was profitable
         """
         self._last_trade_won = won
-
+        
         if won:
             self._consecutive_losses = 0
             self._reset(BreakerType.CONSECUTIVE_LOSSES)
@@ -240,14 +227,14 @@ class CircuitBreaker:
         if self._consecutive_losses >= self.config.consecutive_loss_hard:
             self._trip(BreakerType.CONSECUTIVE_LOSSES, BreakerState.HARD_TRIPPED)
             logger.warning(
-                "Consecutive loss limit hit (hard)",
+                "Consecutive loss limit hit (hard)", 
                 losses=self._consecutive_losses,
                 limit=self.config.consecutive_loss_hard,
             )
         elif self._consecutive_losses >= self.config.consecutive_loss_soft:
             self._trip(BreakerType.CONSECUTIVE_LOSSES, BreakerState.SOFT_TRIPPED)
             logger.warning(
-                "Consecutive loss limit hit (soft)",
+                "Consecutive loss limit hit (soft)", 
                 losses=self._consecutive_losses,
                 limit=self.config.consecutive_loss_soft,
             )
@@ -255,69 +242,74 @@ class CircuitBreaker:
     def check_auto_reset(self) -> list[BreakerType]:
         """
         Check for breakers that should auto-reset based on cooldown.
-
         Call this periodically (e.g., each iteration) to enable auto-reset.
-
+        
         Returns:
             List of breakers that were auto-reset
         """
         reset_breakers = []
         now = time.time()
-
+        
         for breaker, trip_time in list(self._trip_times.items()):
             if breaker == BreakerType.MANUAL:
-                continue  # Manual breaker never auto-resets
-
+                continue # Manual breaker never auto-resets
+                
             state = self._states.get(breaker, BreakerState.CLOSED)
             if state == BreakerState.CLOSED:
                 continue
-
+                
             # Get cooldown for this breaker
             cooldown = self.config.breaker_cooldowns.get(breaker.value, 0)
+            
+            # CRITICAL FIX: Treat -1 as "NEVER RESET"
+            if cooldown == -1:
+                continue # Explicitly disabled auto-reset
+            
             if cooldown <= 0:
                 # Also check global settings
                 if state == BreakerState.SOFT_TRIPPED:
                     cooldown = self.config.soft_reset_seconds
                 else:
                     cooldown = self.config.hard_reset_seconds
-
+            
+            # If still <= 0, then no auto-reset
             if cooldown <= 0:
-                continue  # No auto-reset configured
-
+                continue
+                
             elapsed = now - trip_time
             if elapsed >= cooldown:
                 logger.info(
-                    "Auto-resetting circuit breaker",
+                    "Auto-resetting circuit breaker", 
                     breaker=breaker.value,
                     elapsed_seconds=f"{elapsed:.0f}",
                     cooldown_seconds=f"{cooldown:.0f}",
                 )
                 self._reset(breaker)
                 reset_breakers.append(breaker)
-
+                
                 # Reset related counters
                 if breaker == BreakerType.CONSECUTIVE_LOSSES:
                     self._consecutive_losses = 0
-
+                    
         return reset_breakers
 
     @property
     def consecutive_losses(self) -> int:
         """Get current consecutive loss count."""
         return self._consecutive_losses
-    
+
     def manual_halt(self) -> None:
         """Manually halt all trading."""
         self._manual_halt = True
         self._trip(BreakerType.MANUAL, BreakerState.HARD_TRIPPED)
         logger.warning("Manual trading halt activated")
-    
+
     def manual_resume(self) -> None:
         """Manually resume trading."""
         self._manual_halt = False
         self._reset(BreakerType.MANUAL)
         logger.info("Manual trading resumed")
-    
+
     def _trip(self, breaker: BreakerType, state: BreakerState) -> None:
         """Trip a breaker."""
         old_state = self._states[breaker]
@@ -330,13 +322,13 @@ class CircuitBreaker:
                 breaker=breaker.value,
                 state=state.value,
             )
-    
+
     def _reset(self, breaker: BreakerType) -> None:
         """Reset a breaker to closed."""
         if self._states[breaker] != BreakerState.CLOSED:
             self._states[breaker] = BreakerState.CLOSED
             self._trip_times.pop(breaker, None)
-    
+
     def can_trade(self) -> bool:
         """Check if new trades are allowed."""
         # Hard trip on any breaker = no trading
@@ -344,7 +336,7 @@ class CircuitBreaker:
             if state == BreakerState.HARD_TRIPPED:
                 return False
         return True
-    
+
     def can_enter_new_position(self) -> bool:
         """Check if new position entries are allowed."""
         # Any trip = no new entries
@@ -352,7 +344,7 @@ class CircuitBreaker:
             if state != BreakerState.CLOSED:
                 return False
         return True
-    
+
     def should_flatten(self) -> bool:
         """Check if positions should be flattened."""
         # Hard trip on daily loss or drawdown = flatten
@@ -360,7 +352,7 @@ class CircuitBreaker:
             if self._states[breaker] == BreakerState.HARD_TRIPPED:
                 return True
         return self._manual_halt
-    
+
     def get_status(self, breaker: BreakerType) -> BreakerStatus:
         """Get status of a specific breaker."""
         state = self._states[breaker]
@@ -400,7 +392,7 @@ class CircuitBreaker:
             value = 1.0 if self._manual_halt else 0.0
             soft = hard = 0.5
             msg = "Manual halt" if self._manual_halt else "OK"
-        
+            
         return BreakerStatus(
             breaker_type=breaker,
             state=state,
@@ -410,11 +402,11 @@ class CircuitBreaker:
             message=msg,
             tripped_at=trip_time,
         )
-    
+
     def get_all_status(self) -> list[BreakerStatus]:
         """Get status of all breakers."""
         return [self.get_status(bt) for bt in BreakerType]
-    
+
     def reset_daily(self) -> None:
         """Reset daily counters (call at start of new day)."""
         self._daily_pnl = 0.0

@@ -15,6 +15,11 @@ ENV/
 *.swp
 *.swo
 
+# Agent tooling / build artifacts
+.agent/
+web-client/.next/
+web-client/node_modules/
+
 # Environment
 .env
 .env.local

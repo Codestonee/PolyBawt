@@ -36,6 +36,10 @@ class TradingConfig(BaseModel):
     max_asset_exposure_pct: float = 0.05  # 5% per asset
     cutoff_seconds: int = 60  # Stop trading before expiry
     min_seconds_after_open: int = 30  # Avoid opening volatility
+
+    # Safety: do not let placeholder sentiment inputs affect live sizing.
+    # Enable only once real sentiment/funding inputs are wired.
+    sentiment_sizing_enabled: bool = False
     
     # Favorite fallback betting
     favorite_bet_enabled: bool = True
@@ -45,6 +49,12 @@ class TradingConfig(BaseModel):
     arbitrage_enabled: bool = True
     arbitrage_min_profit_pct: float = 0.005  # 0.5% minimum profit
     arbitrage_max_size: float = 50.00  # Max USD per arb trade
+
+    # Extreme probability trading (near 0% or 100% where fees approach zero)
+    extreme_prob_enabled: bool = True
+    extreme_prob_threshold: float = 0.05  # p < 5% or p > 95%
+    extreme_prob_kelly_boost: float = 1.5  # 50% larger positions at extremes
+    extreme_prob_min_edge: float = 0.02  # Lower edge threshold (2% vs 4%) since fees ~0
     
     @field_validator("kelly_fraction")
     @classmethod
@@ -80,7 +90,7 @@ class RiskConfig(BaseModel):
 
 class ExecutionConfig(BaseModel):
     """Execution parameters."""
-    
+
     rate_limit_buffer_pct: float = 0.10
     ws_reconnect_initial_ms: int = 100
     ws_reconnect_max_ms: int = 5000
@@ -88,6 +98,68 @@ class ExecutionConfig(BaseModel):
     ws_reconnect_jitter: float = 0.2
     order_timeout_ms: int = 5000
     max_retries: int = 3
+
+
+class MarketMakingConfig(BaseModel):
+    """Market making strategy parameters."""
+
+    enabled: bool = False  # Disabled by default (advanced strategy)
+    spread_bps: float = 50.0  # Bid-ask spread in basis points
+    quote_size_usd: float = 10.0  # Size per side
+    max_inventory_usd: float = 100.0  # Max position before skewing
+    skew_bps_per_inventory: float = 1.0  # BPS to skew per $10 inventory
+    min_profit_margin: float = 0.005  # 0.5% minimum expected profit
+
+
+class VPINConfig(BaseModel):
+    """VPIN toxicity filter parameters."""
+
+    enabled: bool = True
+    bucket_size_usd: float = 1000.0  # Volume per bucket
+    n_buckets: int = 50  # Rolling window size
+    halt_threshold: float = 0.6  # VPIN level to halt trading
+    reduce_threshold: float = 0.4  # VPIN level to reduce size
+
+
+class OBIConfig(BaseModel):
+    """Order Book Imbalance signal parameters."""
+
+    enabled: bool = True
+    levels: int = 5  # Number of price levels to analyze
+    strong_threshold: float = 0.4  # Threshold for STRONG_BUY/STRONG_SELL
+    weak_threshold: float = 0.2  # Threshold for BUY/SELL
+    weighted: bool = True  # Weight volume by distance from mid
+
+
+class EventTradingConfig(BaseModel):
+    """Event market trading parameters."""
+
+    enabled: bool = False  # Disabled by default (runs alongside crypto strategy)
+    categories: list[str] = Field(default_factory=lambda: ["politics", "sports", "economics"])
+
+    # Minimum edge thresholds by category
+    min_edge_politics: float = 0.05    # 5% minimum edge
+    min_edge_sports: float = 0.06
+    min_edge_economics: float = 0.04
+    min_edge_pop_culture: float = 0.07
+
+    # Position limits
+    max_position_per_market: float = 50.0
+    max_category_exposure: float = 200.0
+
+    # Rebalancing
+    rebalance_enabled: bool = True
+    rebalance_threshold_pct: float = 0.10  # Rebalance if estimate changes 10%
+
+    # External data refresh intervals (seconds)
+    refresh_polls: int = 3600        # 1 hour
+    refresh_betting_lines: int = 900  # 15 minutes
+    refresh_fed_futures: int = 900    # 15 minutes
+    refresh_sentiment: int = 1800     # 30 minutes
+
+    # Calibration
+    brier_tracking_enabled: bool = True
+    calibration_db_path: str = "data/calibration.db"
 
 
 class ModelsConfig(BaseModel):
@@ -119,16 +191,18 @@ class SecretsConfig(BaseSettings):
     Secrets loaded exclusively from environment variables.
     Never logged or persisted.
     """
-    
+
     polymarket_private_key: str = ""
     polymarket_api_key: str = ""
     polymarket_api_secret: str = ""
     polymarket_passphrase: str = ""
     polymarket_funder_address: str = ""
+    chainlink_client_id: str = ""
+    chainlink_client_secret: str = ""
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     redis_url: str = "redis://localhost:6379/0"
-    
+
     class Config:
         env_prefix = ""  # Use exact env var names
         case_sensitive = False
@@ -150,6 +224,10 @@ class AppConfig(BaseModel):
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     models: ModelsConfig = Field(default_factory=ModelsConfig)
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
+    market_making: MarketMakingConfig = Field(default_factory=MarketMakingConfig)
+    vpin: VPINConfig = Field(default_factory=VPINConfig)
+    obi: OBIConfig = Field(default_factory=OBIConfig)
+    event_trading: EventTradingConfig = Field(default_factory=EventTradingConfig)
 
     @property
     def is_production(self) -> bool:

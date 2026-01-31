@@ -1,20 +1,19 @@
 # =============================================================================
-# LIVE TRADING CONFIGURATION - REAL MONEY
+# LIVE TRADING CONFIGURATION - REVOKED/DISABLED
 # =============================================================================
+# 
+# WARNING: This configuration has been DISABLED after significant losses.
+# DO NOT ENABLE live trading without:
+#   1. Complete code review
+#   2. Proper backtesting
+#   3. Paper trading validation
+#   4. Risk management verification
 #
-# RESEARCH-OPTIMIZED SETTINGS based on:
-# - arXiv:2510.15205 (Polymarket market microstructure)
-# - Claude/Perplexity/Grok research synthesis (2026)
-#
-# Key principles:
-# - Quarter Kelly (0.25) for ~50% of optimal growth with significantly less drawdown
-# - 4% minimum edge after fees (Polymarket fee ~2% at p=0.5)
-# - Conservative risk limits to survive variance
-# - Diversification across BTC/ETH/SOL/XRP with correlation adjustments
-#
+# Current Status: EMERGENCY DISABLED
 # =============================================================================
 
-environment: live
+environment: paper  # FORCED TO PAPER MODE
+dry_run: true      # NO LIVE ORDERS
 
 # -----------------------------------------------------------------------------
 # API Endpoints
@@ -26,192 +25,128 @@ api:
   polygon_chain_id: 137
 
 # -----------------------------------------------------------------------------
-# Trading Parameters
+# Trading Parameters - ALL DISABLED
 # -----------------------------------------------------------------------------
 trading:
-  # Assets to trade (research: XRP provides best diversification)
-  assets: [BTC, ETH, SOL, XRP]
+  assets: []  # NO ASSETS - TRADING DISABLED
+  bankroll: 0.58  # Remaining balance
 
-  # Starting bankroll - UPDATE THIS to your actual balance
-  bankroll: 72.08
+  min_edge_threshold: 0.10  # Increased to 10%
+  kelly_fraction: 0.10  # Very conservative
+  max_position_pct: 0.01  # 1% max
+  max_asset_exposure_pct: 0.02  # 2% max
+  cutoff_seconds: 300  # 5 minutes before expiry
+  min_seconds_after_open: 120  # 2 minutes after open
 
-  # Minimum edge required after fees
-  # Research (claude.md): "Fee at p=0.5 is ~3.125%, so 4% edge is minimum for profit"
-  min_edge_threshold: 0.04 # 4% - conservative, ensures profit after fees
+  favorite_bet_enabled: false
+  favorite_bet_size: 0
 
-  # Kelly fraction for position sizing
-  # Research: "Half-Kelly (0.5x) captures ~75% of optimal growth with ~50% less drawdown"
-  # Research: "Professional money managers typically use 0.10-0.15x Kelly"
-  # Using 0.25 (Quarter Kelly) as balanced approach
-  kelly_fraction: 0.25
+  arbitrage_enabled: false
+  arbitrage_min_profit_pct: 0.02
+  arbitrage_max_size: 0
 
-  # Maximum position size as % of bankroll
-  # Research: "2% per trade" is standard risk management
-  max_position_pct: 0.03 # 3% per trade ($2.16 at current bankroll)
-
-  # Maximum exposure to any single asset
-  # Research: "Sum correlated positions against total Kelly allocation"
-  max_asset_exposure_pct: 0.08 # 8% per asset ($5.77)
-
-  # Timing constraints
-  cutoff_seconds: 60 # Stop trading 60s before expiry
-  min_seconds_after_open: 30 # Avoid opening volatility (first 30s)
-
-  # Favorite Fallback Betting
-  # When no value edge found, bet small on favorite to maintain participation
-  favorite_bet_enabled: true
-  favorite_bet_size: 5.00 # $5 USD - Polymarket minimum order size
-
-  # Arbitrage Trading
-  # Research: "YES + NO < 1.0 guarantees profit"
-  arbitrage_enabled: true
-  arbitrage_min_profit_pct: 0.005 # 0.5% minimum profit after fees
-  arbitrage_max_size: 10.00 # $10 max per arb (conservative)
-
-  # Extreme Probability Trading
-  # Research: "Fee at p=0.01 is $0.0025 vs $1.56 at p=0.50 (62x less!)"
-  # Bet larger at extremes where fees approach zero
-  extreme_prob_enabled: true
-  extreme_prob_threshold: 0.05 # p < 5% or p > 95%
-  extreme_prob_kelly_boost: 1.5 # 50% larger positions at extremes
-  extreme_prob_min_edge: 0.02 # Lower edge threshold (2% vs 4%) since fees ~0
+  extreme_prob_enabled: false
+  extreme_prob_threshold: 0.05
+  extreme_prob_kelly_boost: 1.0
+  extreme_prob_min_edge: 0.05
 
 # -----------------------------------------------------------------------------
 # Risk Management
 # -----------------------------------------------------------------------------
 risk:
-  # Daily loss limits
-  # Research: "3% daily loss pause, 5% daily loss halt"
-  daily_loss_soft_limit_pct: 0.03 # 3% - pause new entries ($2.16)
-  daily_loss_hard_limit_pct: 0.05 # 5% - halt all trading ($3.60)
-
-  # Maximum drawdown kill switch
-  # Research: "10% kill switch" is standard for aggressive strategies
-  max_drawdown_pct: 0.10 # 10% - emergency halt ($7.21)
-
-  # Volatility threshold (annualized)
-  # Pause if market vol exceeds 2x normal
-  volatility_pause_threshold: 2.0
-
-  # Correlation-based position reduction
-  # Research: "Reduce aggregate exposure when correlations spike during market stress"
-  correlation_reduction_threshold: 0.8
+  daily_loss_soft_limit_pct: 0.01  # 1% soft stop
+  daily_loss_hard_limit_pct: 0.02  # 2% hard stop
+  max_drawdown_pct: 0.05  # 5% max drawdown
+  volatility_pause_threshold: 1.5
+  correlation_reduction_threshold: 0.7
 
 # -----------------------------------------------------------------------------
 # Execution Parameters
 # -----------------------------------------------------------------------------
 execution:
-  # Rate limit safety buffer
-  rate_limit_buffer_pct: 0.15 # 15% buffer from API limits
-
-  # WebSocket reconnection (exponential backoff)
+  rate_limit_buffer_pct: 0.20
   ws_reconnect_initial_ms: 100
   ws_reconnect_max_ms: 5000
   ws_reconnect_multiplier: 2.0
   ws_reconnect_jitter: 0.2
+  order_timeout_ms: 5000
+  max_retries: 2
 
-  # Order management
-  order_timeout_ms: 5000 # 5s timeout for order submission
-  max_retries: 3
+# -----------------------------------------------------------------------------
+# Market Making - DISABLED
+# -----------------------------------------------------------------------------
+market_making:
+  enabled: false
+  spread_bps: 50.0
+  quote_size_usd: 0
+  max_inventory_usd: 0
+  skew_bps_per_inventory: 1.0
+  min_profit_margin: 0.005
+
+# -----------------------------------------------------------------------------
+# Event Trading - DISABLED
+# -----------------------------------------------------------------------------
+event_trading:
+  enabled: false
+  categories: []
+  min_edge_politics: 0.10
+  min_edge_sports: 0.10
+  min_edge_economics: 0.10
+  min_edge_pop_culture: 0.10
+  max_position_per_market: 0
+  max_category_exposure: 0
+  rebalance_enabled: false
+  rebalance_threshold_pct: 0.10
+  refresh_polls: 3600
+  refresh_betting_lines: 900
+  refresh_fed_futures: 900
+  refresh_sentiment: 1800
+  brier_tracking_enabled: true
+  calibration_db_path: "data/calibration.db"
+
+# -----------------------------------------------------------------------------
+# VPIN - DISABLED
+# -----------------------------------------------------------------------------
+vpin:
+  enabled: false
+  bucket_size_usd: 1000.0
+  n_buckets: 50
+  halt_threshold: 0.5
+  reduce_threshold: 0.3
+
+# -----------------------------------------------------------------------------
+# OBI Signal - DISABLED
+# -----------------------------------------------------------------------------
+obi:
+  enabled: false
+  levels: 5
+  strong_threshold: 0.4
+  weak_threshold: 0.2
+  weighted: true
 
 # -----------------------------------------------------------------------------
 # Model Parameters
 # -----------------------------------------------------------------------------
 models:
-  # Jump-Diffusion parameters
-  # Research: "Calibrate jump parameters daily - they change more slowly"
-  jump_intensity_per_day: 2.0 # ~2 jumps per day typical for crypto
-  jump_size_std: 0.02 # 2% typical jump size
-
-  # Default annualized volatility by asset
-  # Research: "Use 45-60 day rolling windows for daily volatility"
-  # These are baseline values; real-time calibration updates them
+  jump_intensity_per_day: 2.0
+  jump_size_std: 0.02
   default_volatility:
-    BTC: 0.60 # ~60% annual vol (most liquid, lowest)
-    ETH: 0.70 # ~70% annual vol
-    SOL: 0.85 # ~85% annual vol (higher beta)
-    XRP: 0.90 # ~90% annual vol (most volatile)
+    BTC: 0.60
+    ETH: 0.70
+    SOL: 0.85
+    XRP: 0.90
 
 # -----------------------------------------------------------------------------
 # Observability
 # -----------------------------------------------------------------------------
 observability:
-  log_level: INFO # INFO for live (not DEBUG - too verbose)
-  log_format: clean # Clean emoji-based logs for terminal monitoring
-  metrics_port: 9090 # Prometheus metrics endpoint
-  telegram_enabled: false # Enable for alerts (requires secrets)
+  log_level: INFO
+  log_format: clean
+  metrics_port: 9090
+  telegram_enabled: false
 
 # -----------------------------------------------------------------------------
-# VPIN Toxicity Filter
+# EMERGENCY DISABLED FLAG
 # -----------------------------------------------------------------------------
-# Research: "VPIN measures probability of informed trading flow"
-# When smart money enters, step aside to avoid adverse selection
-vpin:
-  enabled: true
-  bucket_size_usd: 1000.0 # Volume per bucket
-  n_buckets: 50 # Rolling window size
-  halt_threshold: 0.6 # VPIN level to halt trading (high toxicity)
-  reduce_threshold: 0.4 # VPIN level to reduce position sizes
-
-# -----------------------------------------------------------------------------
-# Order Book Imbalance (OBI) Signal
-# -----------------------------------------------------------------------------
-# Research: "Most predictive feature for <15m horizons"
-obi:
-  enabled: true
-  levels: 5 # Number of price levels to analyze
-  strong_threshold: 0.4 # Threshold for STRONG_BUY/STRONG_SELL
-  weak_threshold: 0.2 # Threshold for BUY/SELL
-  weighted: true # Weight volume by distance from mid
-
-# -----------------------------------------------------------------------------
-# Market Making (ADVANCED - Use with caution)
-# -----------------------------------------------------------------------------
-# Two-sided quoting to earn spread and rebates
-# ENABLED: Providing liquidity on crypto markets
-market_making:
-  enabled: true
-  spread_bps: 50.0 # Bid-ask spread in basis points
-  quote_size_usd: 10.0 # Size per side
-  max_inventory_usd: 100.0 # Max position before aggressive skewing
-  skew_bps_per_inventory: 1.0 # BPS to skew per $10 inventory
-  min_profit_margin: 0.005 # 0.5% minimum expected profit
-
-# -----------------------------------------------------------------------------
-# Event Market Trading
-# -----------------------------------------------------------------------------
-# Trading on political, sports, economics, and pop culture markets
-# ENABLED: Diversification across non-crypto markets
-event_trading:
-  enabled: true
-  categories: [politics, sports, economics, pop_culture]
-  
-  # Minimum edge thresholds by category
-  min_edge_politics: 0.05    # 5% minimum edge
-  min_edge_sports: 0.06
-  min_edge_economics: 0.04
-  min_edge_pop_culture: 0.07
-
-  # Position limits (USD)
-  max_position_per_market: 25.0
-  max_category_exposure: 100.0
-
-  # Rebalancing
-  rebalance_enabled: true
-  rebalance_threshold_pct: 0.10
-
-  # External data refresh intervals (seconds)
-  refresh_polls: 3600
-  refresh_betting_lines: 900
-  refresh_fed_futures: 900
-  refresh_sentiment: 1800
-
-  # Calibration tracking
-  brier_tracking_enabled: true
-  calibration_db_path: "data/calibration.db"
-
-# -----------------------------------------------------------------------------
-# LIVE TRADING FLAG
-# -----------------------------------------------------------------------------
-# CRITICAL: This enables real order submission
-dry_run: false
+# DO NOT REMOVE THIS FLAG
+trading_enabled: false  # Master kill switch

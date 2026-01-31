@@ -78,6 +78,50 @@ FILL_AMOUNT_USD = Counter(
 )
 
 # =============================================================================
+# Win Rate Metrics
+# =============================================================================
+
+WIN_RATE = Gauge(
+    "polymarket_win_rate",
+    "All-time win rate (0.0 to 1.0)",
+)
+
+TOTAL_TRADES = Gauge(
+    "polymarket_total_trades",
+    "Total number of closed trades",
+)
+
+TOTAL_WINS = Gauge(
+    "polymarket_total_wins",
+    "Total number of winning trades",
+)
+
+TOTAL_LOSSES = Gauge(
+    "polymarket_total_losses",
+    "Total number of losing trades",
+)
+
+CURRENT_STREAK = Gauge(
+    "polymarket_current_streak",
+    "Current win/loss streak (positive=wins, negative=losses)",
+)
+
+PROFIT_FACTOR = Gauge(
+    "polymarket_profit_factor",
+    "Ratio of gross profit to gross loss",
+)
+
+BIGGEST_WIN = Gauge(
+    "polymarket_biggest_win_usd",
+    "Biggest winning trade in USD",
+)
+
+BIGGEST_LOSS = Gauge(
+    "polymarket_biggest_loss_usd",
+    "Biggest losing trade in USD (negative value)",
+)
+
+# =============================================================================
 # PnL Metrics
 # =============================================================================
 
@@ -380,6 +424,27 @@ class MetricsCollector:
         """Increment iteration counter."""
         ITERATION_COUNT.inc()
         UPTIME_SECONDS.set(time.time() - self._start_time)
+
+    def update_win_rate(
+        self,
+        win_rate: float,
+        total_trades: int,
+        total_wins: int,
+        total_losses: int,
+        current_streak: int,
+        profit_factor: float,
+        biggest_win: float,
+        biggest_loss: float,
+    ) -> None:
+        """Update win rate metrics."""
+        WIN_RATE.set(win_rate)
+        TOTAL_TRADES.set(total_trades)
+        TOTAL_WINS.set(total_wins)
+        TOTAL_LOSSES.set(total_losses)
+        CURRENT_STREAK.set(current_streak)
+        PROFIT_FACTOR.set(profit_factor if profit_factor != float("inf") else 999.0)
+        BIGGEST_WIN.set(biggest_win)
+        BIGGEST_LOSS.set(biggest_loss)
 
 
 # Pre-instantiated collector

@@ -6,12 +6,15 @@ Features:
 - Automatic reconnection
 - Message handlers for order book updates
 - Health monitoring
+- Authenticated user channel support
 """
 
 import asyncio
 import json
 import random
 import time
+import hmac
+import hashlib
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Coroutine
@@ -77,18 +80,29 @@ class WebSocketClient:
         self,
         url: str,
         reconnect_policy: ReconnectPolicy | None = None,
+        api_key: str | None = None,
+        api_secret: str | None = None,
+        api_passphrase: str | None = None,
     ):
         self.url = url
         self.reconnect_policy = reconnect_policy or ReconnectPolicy()
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.api_passphrase = api_passphrase
         
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._state = ConnectionState.DISCONNECTED
         self._subscribed_tokens: set[str] = set()
+        self._user_channel_subscribed = False
         self._handlers: dict[str, list[MessageHandler]] = {}
         self._reconnect_attempt = 0
         self._running = False
         self._last_message_time: float = 0
         self._receive_task: asyncio.Task | None = None
+        
+        # Order book cache
+        self.order_books = {}  # market_id -> {bids, asks}
+        self.recent_trades = {}  # market_id -> [trades]
     
     @property
     def state(self) -> ConnectionState:
@@ -165,6 +179,10 @@ class WebSocketClient:
                 if self._subscribed_tokens:
                     await self._send_subscribe(list(self._subscribed_tokens))
                 
+                # Resubscribe to user channel if needed
+                if self.api_key and self._user_channel_subscribed:
+                    await self._subscribe_user_channel()
+                
                 # Start receive loop
                 self._receive_task = asyncio.create_task(self._receive_loop())
                 return
@@ -208,9 +226,17 @@ class WebSocketClient:
         try:
             data = json.loads(raw_message)
             
-            # Parse message format
+            # Identify message type
+            # Polymarket WS uses 'event_type' for market data, but sometimes just 'type'
             event_type = data.get("event_type") or data.get("type", "unknown")
-            asset_id = data.get("asset_id") or data.get("token_id")
+            asset_id = data.get("asset_id") or data.get("market") or data.get("token_id")
+            
+            # --- RESEARCH CODE INTEGRATION: CACHE UPDATES ---
+            if event_type == "agg_orderbook" or event_type == "book":
+                self._update_orderbook_cache(data, asset_id)
+            elif event_type == "last_trade_price" or event_type == "trade":
+                self._update_trade_cache(data, asset_id)
+            # ------------------------------------------------
             
             msg = WSMessage(
                 event_type=event_type,
@@ -240,6 +266,46 @@ class WebSocketClient:
                     
         except json.JSONDecodeError as e:
             logger.warning("Invalid JSON message", error=str(e))
+
+    def _update_orderbook_cache(self, data: dict, asset_id: str):
+        """Update internal orderbook cache from message."""
+        if not asset_id:
+            return
+            
+        # Format: { "bids": [["price", "size"]], "asks": [...] }
+        bids = data.get("bids", [])
+        asks = data.get("asks", [])
+        
+        self.order_books[asset_id] = {
+            "bids": bids,
+            "asks": asks,
+            "timestamp": time.time()
+        }
+        
+        # Calculate mid price if possible
+        if bids and asks:
+            try:
+                best_bid = float(bids[0][0])
+                best_ask = float(asks[0][0])
+                mid_price = (best_bid + best_ask) / 2
+                self.order_books[asset_id]["mid_price"] = mid_price
+                self.order_books[asset_id]["spread"] = best_ask - best_bid
+            except (ValueError, IndexError):
+                pass
+
+    def _update_trade_cache(self, data: dict, asset_id: str):
+        """Update internal trade history cache."""
+        if not asset_id:
+            return
+            
+        if asset_id not in self.recent_trades:
+            self.recent_trades[asset_id] = []
+            
+        self.recent_trades[asset_id].append(data)
+        
+        # Keep last 100 trades
+        if len(self.recent_trades[asset_id]) > 100:
+            self.recent_trades[asset_id] = self.recent_trades[asset_id][-100:]
     
     async def _handle_disconnect(self) -> None:
         """Handle disconnection and attempt reconnection."""
@@ -264,6 +330,12 @@ class WebSocketClient:
         if self.is_connected:
             await self._send_subscribe(token_ids)
     
+    async def subscribe_user(self) -> None:
+        """Subscribe to authenticated user channel."""
+        self._user_channel_subscribed = True
+        if self.is_connected:
+            await self._subscribe_user_channel()
+
     async def unsubscribe(self, token_ids: list[str]) -> None:
         """Unsubscribe from token updates."""
         for token_id in token_ids:
@@ -277,6 +349,7 @@ class WebSocketClient:
         if not self._ws:
             return
         
+        # Polymarket format: {"assets_ids": [...], "type": "market"}
         message = {
             "type": "market",
             "assets_ids": token_ids
@@ -284,6 +357,34 @@ class WebSocketClient:
         await self._ws.send(json.dumps(message))
         logger.debug("Subscribed to tokens", count=len(token_ids))
     
+    async def _subscribe_user_channel(self) -> None:
+        """Send authenticated user subscription."""
+        if not self._ws or not self.api_key:
+            logger.warning("Cannot subscribe to user channel: Missing keys or connection")
+            return
+
+        # Create ClobAuth signature
+        timestamp = str(int(time.time() * 1000))
+        msg = timestamp + 'GET' + '/ws/events'  # Endpoint for signing
+        
+        signature = hmac.new(
+            self.api_secret.encode('utf-8'),
+            msg.encode('utf-8'),
+            hashlib.sha256
+        ).hexdigest()
+
+        message = {
+            "type": "user",
+            "auth": {
+                "apiKey": self.api_key,
+                "signature": signature,
+                "timestamp": timestamp,
+                "passphrase": self.api_passphrase
+            }
+        }
+        await self._ws.send(json.dumps(message))
+        logger.info("Subscribed to user channel")
+
     async def _send_unsubscribe(self, token_ids: list[str]) -> None:
         """Send unsubscription message."""
         if not self._ws:
@@ -326,20 +427,31 @@ class WebSocketClient:
         
         # Consider unhealthy if no message in 60 seconds
         return self.last_message_age_seconds < 60
+    
+    # --- RESEARCH ACCESSORS ---
+    def get_orderbook(self, market_id: str) -> dict | None:
+        """Get cached orderbook for market."""
+        return self.order_books.get(market_id)
+    
+    def get_recent_trades(self, market_id: str) -> list[dict]:
+        """Get cached trades for market."""
+        return self.recent_trades.get(market_id, [])
 
 
 async def create_market_ws_client(
     url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market",
     reconnect_policy: ReconnectPolicy | None = None,
+    api_key: str | None = None,
+    api_secret: str | None = None,
+    api_passphrase: str | None = None,
 ) -> WebSocketClient:
     """
     Factory function to create a configured WebSocket client.
-    
-    Args:
-        url: WebSocket URL
-        reconnect_policy: Custom reconnection policy
-    
-    Returns:
-        Configured WebSocket client (not yet connected)
     """
-    return WebSocketClient(url=url, reconnect_policy=reconnect_policy)
+    return WebSocketClient(
+        url=url, 
+        reconnect_policy=reconnect_policy,
+        api_key=api_key,
+        api_secret=api_secret,
+        api_passphrase=api_passphrase
+    )

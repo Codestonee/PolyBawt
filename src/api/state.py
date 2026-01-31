@@ -11,6 +11,8 @@ class BotState:
     active_orders: List[Any] = field(default_factory=list)
     recent_signals: List[Any] = field(default_factory=list)
     is_running: bool = False
+    is_live: bool = False  # True if sending real orders
+    active_strategies: dict[str, bool] = field(default_factory=dict)
     last_update: float = 0
 
 

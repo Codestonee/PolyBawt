@@ -8,6 +8,47 @@ Research findings:
 - "Order book features often beat academic models" (65-75% vs 55-65% accuracy)
 - "Ensemble approach with dynamic weighting outperforms single models"
 - "Bates SVJ achieves lowest MAPE for ETH; Kou lowest RMSE for BTC"
+
+CRITICAL - BACKTESTING REQUIREMENTS (Walk-Forward Validation):
+=============================================================
+NEVER use random k-fold cross-validation for this model. Research (claude.md):
+"Walk-forward validation preserves temporal causality: training data MUST
+precede test data. Random k-fold gives optimistically biased estimates due
+to information leakage."
+
+When backtesting, you MUST use walk-forward (rolling/expanding window) validation:
+
+1. EXPANDING WINDOW:
+   - Train on [0, T], test on [T+1, T+gap]
+   - Train on [0, T+gap], test on [T+gap+1, T+2*gap]
+   - Continue expanding training window
+
+2. ROLLING WINDOW (fixed size):
+   - Train on [0, window], test on [window+1, window+gap]
+   - Train on [gap, window+gap], test on [window+gap+1, window+2*gap]
+   - Slide window forward
+
+3. REQUIRED GAP:
+   - Always include a gap between train and test (e.g., 1 hour) to prevent
+     look-ahead bias from correlated observations
+
+4. MINIMUM SAMPLES:
+   - Minimum 500-1000 resolved markets for statistical significance
+   - Must span bull, bear, and sideways regimes
+
+Example implementation:
+```python
+def walk_forward_backtest(data, train_size=1000, test_size=100, gap=10):
+    results = []
+    for start in range(0, len(data) - train_size - test_size - gap, test_size):
+        train = data[start:start + train_size]
+        test = data[start + train_size + gap:start + train_size + gap + test_size]
+
+        model.fit(train)
+        predictions = model.predict(test)
+        results.append(evaluate(predictions, test.outcomes))
+    return aggregate(results)
+```
 """
 
 from dataclasses import dataclass, field

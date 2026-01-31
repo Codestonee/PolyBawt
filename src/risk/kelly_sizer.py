@@ -46,6 +46,7 @@ class KellySizeResult:
     capped_by_max_position: bool = False
     capped_by_max_asset: bool = False
     capped_by_kelly_cap: bool = False
+    capped_by_absolute: bool = False  # Absolute USD cap
 
     # Adaptive adjustments applied
     volatility_multiplier: float = 1.0
@@ -125,6 +126,7 @@ class KellySizer:
         max_position_pct: float = 0.02,  # 2% per trade
         max_asset_exposure_pct: float = 0.05,  # 5% per asset
         kelly_cap: float = 0.25,  # Never recommend > 25% Kelly
+        max_position_usd: float = 100.0,  # Absolute max $100 per trade
         adaptive_mode: AdaptiveMode = AdaptiveMode.FULL,
         adaptive_config: AdaptiveKellyConfig | None = None,
     ):
@@ -133,6 +135,7 @@ class KellySizer:
         self.max_position_pct = max_position_pct
         self.max_asset_exposure_pct = max_asset_exposure_pct
         self.kelly_cap = kelly_cap
+        self.max_position_usd = max_position_usd  # Absolute safety cap
         self.adaptive_mode = adaptive_mode
         self.adaptive_config = adaptive_config or AdaptiveKellyConfig()
 
@@ -392,6 +395,18 @@ class KellySizer:
             size_usd = max(0, max_additional)
             recommended = size_usd / self.bankroll if self.bankroll > 0 else 0
             capped_max_asset = True
+        
+        # Absolute safety cap in USD (anti-whale protection)
+        capped_absolute = False
+        if size_usd > self.max_position_usd:
+            size_usd = self.max_position_usd
+            recommended = size_usd / self.bankroll if self.bankroll > 0 else 0
+            capped_absolute = True
+            logger.info(
+                "Position capped by absolute limit",
+                max_position_usd=self.max_position_usd,
+                requested_size=size_usd,
+            )
 
         return KellySizeResult(
             kelly_fraction=kelly,
@@ -400,6 +415,7 @@ class KellySizer:
             capped_by_max_position=capped_max_pos,
             capped_by_max_asset=capped_max_asset,
             capped_by_kelly_cap=capped_kelly,
+            capped_by_absolute=capped_absolute,
             volatility_multiplier=vol_mult,
             drawdown_multiplier=dd_mult,
             uncertainty_multiplier=unc_mult,

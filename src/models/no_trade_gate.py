@@ -63,31 +63,34 @@ class GateResult:
 @dataclass
 class TradeContext:
     """Context for evaluating a potential trade."""
-    
+
     # Trade details
     ev_result: EVResult
     asset: str
     token_id: str
-    
+
     # Timing
     seconds_to_expiry: float
     seconds_since_open: float = 0
-    
+
     # Market quality
     spread: float = 0  # Bid-ask spread
     book_depth_usd: float = 1000  # Depth on our side
     oracle_age_seconds: float | None = None  # None means missing data (fail-safe)
-    
+
     # Portfolio state
     current_position_usd: float = 0
     correlation_with_portfolio: float = 0
     realized_vol_15m: float = 0.6  # Annualized
-    
+
     # System state
     daily_pnl_pct: float = 0
     current_drawdown_pct: float = 0
     rate_limit_usage_pct: float = 0
     trading_halted: bool = False
+
+    # Dynamic overrides (e.g., for extreme probability markets)
+    override_min_edge: float | None = None  # If set, overrides config.min_edge_threshold
 
 
 @dataclass
@@ -217,10 +220,12 @@ class NoTradeGate:
     def _check_edge_threshold(
         self, ctx: TradeContext
     ) -> tuple[RejectionReason | None, str]:
-        if abs(ctx.ev_result.gross_edge) < self.config.min_edge_threshold:
+        # Use override if provided (e.g., for extreme probability markets with lower fees)
+        min_edge = ctx.override_min_edge if ctx.override_min_edge is not None else self.config.min_edge_threshold
+        if abs(ctx.ev_result.gross_edge) < min_edge:
             return (
                 RejectionReason.NO_DIRECTIONAL_CONVICTION,
-                f"Edge {ctx.ev_result.gross_edge:.3f} < {self.config.min_edge_threshold}"
+                f"Edge {ctx.ev_result.gross_edge:.3f} < {min_edge}"
             )
         return None, ""
     

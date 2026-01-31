@@ -23,6 +23,22 @@ class PositionModel(BaseModel):
     pnl_percent: float
 
 
+class WinRateModel(BaseModel):
+    """Win rate and trading statistics."""
+    total_trades: int
+    total_wins: int
+    total_losses: int
+    win_rate: float  # Percentage (0-100)
+    current_streak: int  # Positive = wins, negative = losses
+    max_consecutive_wins: int
+    max_consecutive_losses: int
+    biggest_win: float
+    biggest_loss: float
+    average_win: float
+    average_loss: float
+    profit_factor: float | str  # Can be "inf" if no losses
+
+
 class PortfolioModel(BaseModel):
     balance: float
     equity: float
@@ -30,6 +46,11 @@ class PortfolioModel(BaseModel):
     daily_pnl: float
     daily_return_pct: float
     positions: List[PositionModel]
+    win_rate: WinRateModel | None = None
+
+    # Safety/UX: these help the dashboard avoid showing fake precision.
+    unrealized_pnl_available: bool = False
+    note: str | None = None
 
 
 class OrderModel(BaseModel):
@@ -64,12 +85,34 @@ app.add_middleware(
 )
 
 
+@app.get("/")
+async def root():
+    """API root - lists available endpoints."""
+    state = get_state()
+    return {
+        "name": "Polymarket Bot API",
+        "version": "1.0.0",
+        "status": "online",
+        "bot_running": state.is_running,
+        "is_live": state.is_live,
+        "endpoints": {
+            "health": "/health",
+            "portfolio": "/api/portfolio",
+            "stats": "/api/stats",
+            "orders": "/api/orders"
+        },
+        "docs": "/docs"
+    }
+
+
 @app.get("/health")
 async def health_check():
     state = get_state()
     return {
         "status": "online",
         "bot_running": state.is_running,
+        "is_live": state.is_live,
+        "active_strategies": state.active_strategies,
         "last_update": state.last_update
     }
 
@@ -88,7 +131,21 @@ async def get_portfolio():
             total_exposure=0,
             daily_pnl=0,
             daily_return_pct=0,
-            positions=[]
+            positions=[],
+            win_rate=WinRateModel(
+                total_trades=0,
+                total_wins=0,
+                total_losses=0,
+                win_rate=0.0,
+                current_streak=0,
+                max_consecutive_wins=0,
+                max_consecutive_losses=0,
+                biggest_win=0.0,
+                biggest_loss=0.0,
+                average_win=0.0,
+                average_loss=0.0,
+                profit_factor=0.0,
+            )
         )
     
     # Convert Portfolio object to API model
@@ -103,14 +160,13 @@ async def get_portfolio():
     # Ideally, Portfolio should have the latest mark prices.
     # For now, we return the tracked structure.
     
+    # We currently do NOT have reliable mark prices available at the API layer.
+    # So we report position value at entry (not "current") and set pnl to 0.
     for p in pf.get_open_positions():
-        # simple estimation if we don't have live mark price in the object
-        # The portfolio object relies on settle_position or unrealized_pnl(prices) 
-        # API layer might not have fresh prices immediately available unless shared
-        current_val = p.size_usd # Placeholder if we don't have live mark
+        current_val = p.current_value
         pnl = 0.0
         pnl_pct = 0.0
-        
+
         positions_data.append(PositionModel(
             asset=p.asset,
             side=p.side.value if hasattr(p.side, 'value') else str(p.side),
@@ -118,16 +174,75 @@ async def get_portfolio():
             entry_price=p.entry_price,
             current_value=current_val,
             pnl=pnl,
-            pnl_percent=pnl_pct
+            pnl_percent=pnl_pct,
         ))
+
+    # Build win rate stats
+    win_rate_data = WinRateModel(
+        total_trades=summary.get("total_trades", 0),
+        total_wins=summary.get("total_wins", 0),
+        total_losses=summary.get("total_losses", 0),
+        win_rate=summary.get("win_rate", 0.0),
+        current_streak=summary.get("current_streak", 0),
+        max_consecutive_wins=summary.get("max_consecutive_wins", 0),
+        max_consecutive_losses=summary.get("max_consecutive_losses", 0),
+        biggest_win=summary.get("biggest_win", 0.0),
+        biggest_loss=summary.get("biggest_loss", 0.0),
+        average_win=summary.get("average_win", 0.0),
+        average_loss=summary.get("average_loss", 0.0),
+        profit_factor=summary.get("profit_factor", 0.0),
+    )
 
     return PortfolioModel(
         balance=pf.current_capital,
-        equity=pf.current_capital + pf.unrealized_pnl({}), # PnL needs prices
+        # Without reliable mark prices, equity == balance.
+        equity=pf.current_capital,
         total_exposure=pf.total_exposure,
         daily_pnl=summary.get("daily_pnl", 0),
         daily_return_pct=summary.get("daily_return_pct", 0),
-        positions=positions_data
+        positions=positions_data,
+        win_rate=win_rate_data,
+        unrealized_pnl_available=False,
+        note="Unrealized PnL/equity marks not available (no live mark prices wired to API).",
+    )
+
+
+@app.get("/api/stats", response_model=WinRateModel)
+async def get_stats():
+    """Get trading statistics including win rate."""
+    state = get_state()
+    pf = state.portfolio
+
+    if not pf:
+        return WinRateModel(
+            total_trades=0,
+            total_wins=0,
+            total_losses=0,
+            win_rate=0.0,
+            current_streak=0,
+            max_consecutive_wins=0,
+            max_consecutive_losses=0,
+            biggest_win=0.0,
+            biggest_loss=0.0,
+            average_win=0.0,
+            average_loss=0.0,
+            profit_factor=0.0,
+        )
+
+    summary = pf.summary()
+    return WinRateModel(
+        total_trades=summary.get("total_trades", 0),
+        total_wins=summary.get("total_wins", 0),
+        total_losses=summary.get("total_losses", 0),
+        win_rate=summary.get("win_rate", 0.0),
+        current_streak=summary.get("current_streak", 0),
+        max_consecutive_wins=summary.get("max_consecutive_wins", 0),
+        max_consecutive_losses=summary.get("max_consecutive_losses", 0),
+        biggest_win=summary.get("biggest_win", 0.0),
+        biggest_loss=summary.get("biggest_loss", 0.0),
+        average_win=summary.get("average_win", 0.0),
+        average_loss=summary.get("average_loss", 0.0),
+        profit_factor=summary.get("profit_factor", 0.0),
     )
 
 
@@ -149,3 +264,16 @@ async def get_orders():
             timestamp=str(getattr(o, "timestamp", ""))
         ))
     return api_orders
+
+
+# Entry point for running standalone
+if __name__ == "__main__":
+    import uvicorn
+    print("🌐 Starting Polymarket Bot API Server...")
+    print("📡 API: http://localhost:8000")
+    print("📊 Health: http://localhost:8000/health")
+    print("💼 Portfolio: http://localhost:8000/api/portfolio")
+    print("📈 Stats: http://localhost:8000/api/stats")
+    print("📋 Orders: http://localhost:8000/api/orders")
+    print("\n⚠️  Note: Run with main bot for live data updates")
+    uvicorn.run(app, host="127.0.0.1", port=8000, log_level="info")

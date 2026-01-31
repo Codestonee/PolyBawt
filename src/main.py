@@ -18,6 +18,7 @@ from pathlib import Path
 
 from src.infrastructure.config import init_config, get_config, get_secrets, AppConfig
 from src.infrastructure.logging import configure_logging, get_logger, bind_context
+from src.infrastructure.kill_switch import kill_switch, KillSwitchEvent
 from src.ingestion.ws_client import WebSocketClient, ReconnectPolicy
 from src.ingestion.market_discovery import MarketDiscovery
 from src.ingestion.oracle_feed import OracleFeed
@@ -26,10 +27,12 @@ from src.execution.rate_limiter import RateLimiter
 from src.execution.clob_client import CLOBClient
 from src.risk.circuit_breaker import CircuitBreaker
 from src.strategy.value_betting import ValueBettingStrategy
+from src.strategy.event_betting import EventBettingStrategy
 from src.portfolio.tracker import Portfolio
+from src.ingestion.event_market_discovery import EventMarketDiscovery
 
 
-async def run_strategy(config: AppConfig) -> None:
+async def run_crypto_strategy(config: AppConfig) -> None:
     """Initialize and run the value betting strategy."""
     logger = get_logger(__name__)
     
@@ -53,26 +56,17 @@ async def run_strategy(config: AppConfig) -> None:
 
     # Create submit callback that uses CLOBClient for live orders
     async def submit_order_callback(order):
-        """Submit order to exchange via CLOB client."""
-        from src.execution.order_manager import OrderState
-        response = await clob_client.place_order(
+        """Submit order to exchange via CLOB client.
+
+        IMPORTANT: Return the exchange response; OrderManager owns state transitions.
+        """
+        return await clob_client.place_order(
             token_id=order.token_id,
             side=order.side.value,
             price=order.price,
             size=order.size,
             client_order_id=order.client_order_id,
         )
-        if response.success:
-            order.exchange_order_id = response.exchange_order_id
-            order.update_state(OrderState.NEW)
-            logger.info("Order submitted to exchange", 
-                       exchange_order_id=response.exchange_order_id,
-                       client_order_id=order.client_order_id)
-        else:
-            order.update_state(OrderState.REJECTED)
-            logger.error("Order rejected by exchange",
-                        error_code=response.error_code,
-                        error_message=response.error_message)
 
     order_manager = OrderManager(
         dry_run=config.dry_run, 
@@ -87,6 +81,23 @@ async def run_strategy(config: AppConfig) -> None:
     circuit_breaker = CircuitBreaker(starting_capital=bankroll)
 
     portfolio = Portfolio(starting_capital=bankroll)
+    
+    # PERISTENCE: Load state from disk
+    portfolio.load_state()
+    
+    # SYNC: Fetch real balance if possible
+    # Even in dry_run, if we have keys (authed read-only), we get real balance
+    try:
+        real_balance = await clob_client.get_account_balance()
+        if real_balance > 0:
+            logger.info(u"Synced real balance from Polymarket", balance=f"${real_balance:.2f}")
+            portfolio.current_capital = real_balance
+            portfolio.peak_capital = max(portfolio.peak_capital, real_balance)
+            # Update circuit breaker too
+            circuit_breaker.update_drawdown(real_balance)
+            # Update Kelly sizer too? (It's in strategy init, passed via portfolio reference usually or updated dynamically)
+    except Exception as e:
+        logger.warning("Failed to sync balance", error=str(e))
     
     # Sync to global state for API
     from src.api.state import get_state
@@ -118,8 +129,13 @@ async def run_strategy(config: AppConfig) -> None:
             pass  # Windows
     
     try:
-        logger.info("Starting strategy")
+        logger.info("Starting crypto strategy")
         await strategy.run()
+    except asyncio.CancelledError:
+        logger.info("Crypto strategy task cancelled")
+    except Exception as e:
+        logger.exception("Crypto strategy crashed", error=str(e))
+        raise # Re-raise to trigger restart logic if needed
     finally:
         # Cleanup
         await market_discovery.close()
@@ -128,10 +144,109 @@ async def run_strategy(config: AppConfig) -> None:
         # Log final metrics
         metrics = strategy.get_metrics()
         logger.info(
-            "Strategy completed",
+            "Crypto strategy completed",
             signals=metrics["signals_generated"],
             passed_gate=metrics["signals_passed_gate"],
             orders=metrics["orders_placed"],
+        )
+
+
+async def run_event_strategy(config: AppConfig) -> None:
+    """Initialize and run the event betting strategy."""
+    logger = get_logger(__name__)
+    
+    if not config.event_trading.enabled:
+        logger.info("Event trading disabled")
+        return
+    
+    logger.info(
+        "Initializing event strategy",
+        categories=config.event_trading.categories,
+    )
+    
+    # Initialize components
+    event_market_discovery = EventMarketDiscovery(base_url=config.api.gamma_base_url)
+    rate_limiter = RateLimiter()
+
+    # CLOB client for order execution
+    clob_client = CLOBClient(
+        dry_run=config.dry_run,
+        rate_limiter=rate_limiter,
+    )
+    await clob_client.initialize()
+
+    # Create submit callback
+    async def submit_order_callback(order):
+        """Submit order to exchange via CLOB client.
+
+        IMPORTANT: Return the exchange response; OrderManager owns state transitions.
+        """
+        return await clob_client.place_order(
+            token_id=order.token_id,
+            side=order.side.value,
+            price=order.price,
+            size=order.size,
+            client_order_id=order.client_order_id,
+        )
+
+    order_manager = OrderManager(
+        dry_run=config.dry_run, 
+        rate_limiter=rate_limiter,
+        submit_callback=submit_order_callback if not config.dry_run else None,
+    )
+
+    # Risk management
+    bankroll = config.trading.bankroll * 0.5  # Allocate 50% to event markets
+    circuit_breaker = CircuitBreaker(starting_capital=bankroll)
+
+    from src.portfolio.tracker import Portfolio
+    portfolio = Portfolio(starting_capital=bankroll)
+    portfolio.load_state()
+
+    # Create strategy
+    strategy = EventBettingStrategy(
+        config=config,
+        market_discovery=event_market_discovery,
+        order_manager=order_manager,
+        rate_limiter=rate_limiter,
+        circuit_breaker=circuit_breaker,
+        clob_client=clob_client,
+        portfolio=portfolio,
+        bankroll=bankroll,
+    )
+    
+    # Set up shutdown handler
+    def handle_shutdown():
+        logger.info("Shutdown requested for event strategy")
+        strategy.stop()
+    
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, handle_shutdown)
+        except NotImplementedError:
+            pass
+    
+    try:
+        logger.info("Starting event betting strategy")
+        await strategy.run()
+    except asyncio.CancelledError:
+        logger.info("Event strategy task cancelled")
+    except Exception as e:
+        logger.exception("Event strategy crashed", error=str(e))
+        raise
+    finally:
+        # Cleanup
+        await event_market_discovery.close()
+        
+        # Log final metrics
+        metrics = strategy.get_metrics()
+        logger.info(
+            "Event strategy completed",
+            markets_analyzed=metrics["markets_analyzed"],
+            signals=metrics["signals_generated"],
+            orders=metrics["orders_placed"],
+            brier_score=metrics.get("brier_score"),
         )
 
 
@@ -183,9 +298,11 @@ async def async_main() -> None:
         print("This is a safety measure to prevent accidental live trading")
         sys.exit(1)
     
-    # Override dry_run if not --live
-    if not args.live:
-        config.dry_run = True
+    # Override dry_run depending on --live flag
+    if args.live:
+        config.dry_run = False  # Force live
+    else:
+        config.dry_run = True   # Force paper
     
     # Configure logging
     log_format = "clean" if args.clean else config.observability.log_format
@@ -209,16 +326,87 @@ async def async_main() -> None:
     from src.api.server import app
     from src.api.state import get_state
 
-    api_config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="error")
+    api_config = uvicorn.Config(app, host="127.0.0.1", port=8000, log_level="error")
     server = uvicorn.Server(api_config)
     
     # Run API server concurrently with strategy
     api_task = asyncio.create_task(server.serve())
     get_state().is_running = True
+    get_state().is_live = not config.dry_run
+
+    # Populate active strategies for Dashboard & Terminal
+    strategies = {
+        "Value Betting": True,  # Core
+        "Extreme Probability": config.trading.extreme_prob_enabled,
+        "Arbitrage": config.trading.arbitrage_enabled,
+        "Favorite Fallback": config.trading.favorite_bet_enabled,
+        "Market Making": config.market_making.enabled,
+        "VPIN Filter": config.vpin.enabled,
+        "OBI Signal": config.obi.enabled,
+        "Event Markets": config.event_trading.enabled,
+    }
+    get_state().active_strategies = strategies
+
+    # Print Easy-to-Read Terminal Output
+    print("\n" + "="*60)
+    print(f"🤖 POLYMARKET BOT - {'LIVE TRADING 🔴' if args.live else 'PAPER TRADING ⚪'}")
+    print("="*60)
+    print(f"{'STRATEGY':<25} | {'STATUS':<10} | {'MODE':<10}")
+    print("-" * 50)
+    for name, enabled in strategies.items():
+        status = "✅ ON" if enabled else "❌ OFF"
+        mode = "Auto" if name != "Market Making" else "Manual"
+        print(f"{name:<25} | {status:<10} | {mode:<10}")
+    print("="*60 + "\n")
+
+    # Set up kill switch monitoring
+    async def on_kill_switch(event: KillSwitchEvent):
+        """Handle kill switch trigger."""
+        logger.critical(
+            "Kill switch activated - halting all strategies",
+            reason=event.reason,
+            type=event.switch_type.value,
+        )
+        # Cancel all strategy tasks
+        for task in [crypto_task, event_task]:
+            if not task.done():
+                task.cancel()
+    
+    kill_switch.register_callback(on_kill_switch)
+    await kill_switch.start_monitoring()
     
     try:
-        await run_strategy(config)
+        # Run both strategies concurrently
+        crypto_task = asyncio.create_task(run_crypto_strategy(config))
+        event_task = asyncio.create_task(run_event_strategy(config))
+        
+        # Monitor for kill switch in parallel
+        async def kill_switch_monitor():
+            while True:
+                if await kill_switch.check():
+                    logger.critical("Kill switch detected - stopping strategies")
+                    crypto_task.cancel()
+                    event_task.cancel()
+                    break
+                await asyncio.sleep(1.0)
+        
+        monitor_task = asyncio.create_task(kill_switch_monitor())
+        
+        # Use asyncio.gather to keep running until ALL tasks are done (or error)
+        # return_exceptions=True prevents one crash from killing the other
+        await asyncio.gather(
+            crypto_task, 
+            event_task, 
+            monitor_task, 
+            return_exceptions=True
+        )
+        
+    except asyncio.CancelledError:
+        logger.info("Main loop cancelled")
+    except Exception as e:
+        logger.exception("Main loop crashed", error=str(e))
     finally:
+        await kill_switch.stop_monitoring()
         get_state().is_running = False
         api_task.cancel()
         try:

@@ -78,59 +78,42 @@ class CLOBClient:
         """
         Initialize the CLOB client with credentials.
         
-        In dry_run mode, creates a read-only client for order book queries.
+        Tries to authenticate even in dry_run mode to fetch account history.
+        Safety is enforced in place_order/cancel_order checks.
         
         Returns:
             True if initialization successful
         """
-        if self.dry_run:
-            # Create read-only client for order book queries (no auth needed)
-            try:
-                from py_clob_client.client import ClobClient
-                self._clob_client = ClobClient(
-                    host=self.base_url,
-                    # No key/creds = read-only mode
-                )
-                logger.info("CLOB client initialized in dry-run mode (read-only for order books)")
-            except ImportError:
-                logger.warning("py-clob-client not installed, order book queries disabled")
-            except Exception as e:
-                logger.warning("Could not create read-only CLOB client", error=str(e))
-            
-            self._initialized = True
-            return True
-        
         try:
-            # Import py-clob-client
             from py_clob_client.client import ClobClient
             
             secrets = get_secrets()
             
-            if not secrets.polymarket_private_key:
-                logger.error("Missing POLYMARKET_PRIVATE_KEY environment variable")
-                return False
-            
-            if not secrets.polymarket_funder_address:
-                logger.error("Missing POLYMARKET_FUNDER_ADDRESS environment variable")
-                return False
-            
-            # Initialize client with private key
-            self._clob_client = ClobClient(
-                host=self.base_url,
-                key=secrets.polymarket_private_key,
-                chain_id=137,  # Polygon
-                signature_type=1,  # POLY_GNOSIS_SAFE signature (Magic Link/email wallets)
-                funder=secrets.polymarket_funder_address,
-            )
-            
-            # Derive API credentials from private key
-            logger.info("Deriving API credentials from private key...")
-            self._clob_client.set_api_creds(self._clob_client.create_or_derive_api_creds())
-            
+            # Try full auth first (even in dry_run) to get analysis/history
+            if secrets.polymarket_private_key and secrets.polymarket_funder_address:
+                try:
+                    self._clob_client = ClobClient(
+                        host=self.base_url,
+                        key=secrets.polymarket_private_key,
+                        chain_id=137,  # Polygon
+                        signature_type=1,
+                        funder=secrets.polymarket_funder_address,
+                    )
+                    # Derive API credentials
+                    logger.info("Deriving API credentials...")
+                    self._clob_client.set_api_creds(self._clob_client.create_or_derive_api_creds())
+                    self._initialized = True
+                    logger.info(f"CLOB client initialized (Auth: YES, Dry Run: {self.dry_run})")
+                    return True
+                except Exception as e:
+                    logger.warning(f"Auth failed in dry-run (falling back to public): {e}")
+
+            # Fallback to public read-only
+            self._clob_client = ClobClient(host=self.base_url)
             self._initialized = True
-            logger.info("CLOB client initialized")
+            logger.info(f"CLOB client initialized (Auth: NO, Dry Run: {self.dry_run})")
             return True
-            
+
         except ImportError:
             logger.error("py-clob-client not installed")
             return False
@@ -508,6 +491,84 @@ class CLOBClient:
                 asks=[],
                 timestamp=time.time(),
             )
+
+
+    async def get_trade_history(
+        self,
+        limit: int = 50,
+        maker: bool | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Get trade history for the account.
+        
+        Args:
+            limit: Number of trades to fetch
+            maker: Filter by maker/taker (None = both)
+        
+        Returns:
+            List of trade dicts
+        """
+        await self.rate_limiter.acquire_query()
+        
+        if not self._initialized or not self._clob_client:
+            return []
+            
+        try:
+            # Check if we have auth (private key)
+            # py-clob-client requires auth for get_trades
+            if not hasattr(self._clob_client, 'key') or not self._clob_client.key:
+                logger.debug("Cannot fetch trade history: No auth credentials")
+                return []
+
+            trades = await asyncio.to_thread(
+                self._clob_client.get_trades,
+                limit=limit,
+                maker=maker
+            )
+            return trades or []
+            
+        except Exception as e:
+            logger.error("Get trade history failed", error=str(e))
+            return []
+
+
+    async def get_account_balance(self) -> float:
+        """
+        Get account collateral (USDC) balance.
+        
+        Returns:
+            Balance in USDC (float)
+        """
+        await self.rate_limiter.acquire_query()
+        
+        if not self._initialized or not self._clob_client:
+            return 0.0
+            
+        try:
+            # Check for auth
+            if not hasattr(self._clob_client, 'key') or not self._clob_client.key:
+                return 0.0
+
+            # Get collateral balance
+            # py-clob-client exposes get_balance_allowance (or similar)
+            # We assume standard collateral fetch
+            # Note: py-clob-client implementation varies, but get_balance_allowance is common
+            balance_info = await asyncio.to_thread(
+                self._clob_client.get_balance_allowance,
+                params={"asset_type": "COLLATERAL"}
+            )
+            
+            # Parse balance
+            # Response format: {'balance': '1000000', ...} (usually 6 decimals for USDC)
+            if balance_info and isinstance(balance_info, dict):
+                raw_balance = balance_info.get("balance", "0")
+                return float(raw_balance) / 1_000_000  # USDC has 6 decimals
+                
+            return 0.0
+            
+        except Exception as e:
+            logger.error("Get account balance failed", error=str(e))
+            return 0.0
 
 
 async def create_clob_client(

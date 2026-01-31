@@ -49,8 +49,9 @@ def logit(p: float) -> float:
     
     Maps (0,1) -> (-∞,+∞)
     """
-    # Clamp to avoid log(0) or log(inf)
-    p = max(0.001, min(0.999, p))
+    # Clamp to avoid log(0) or log(inf) - tighter bounds for numerical stability
+    EPSILON = 1e-10
+    p = max(EPSILON, min(1.0 - EPSILON, p))
     return math.log(p / (1 - p))
 
 
@@ -143,7 +144,7 @@ def factorial(n: int) -> int:
 
 @dataclass
 class JumpDiffusionParams:
-    """Parameters for Jump-Diffusion model."""
+    """Parameters for Jump-Diffusion model with validation."""
     
     # Base volatility (annualized)
     sigma: float = 0.60  # 60% default for BTC
@@ -155,6 +156,47 @@ class JumpDiffusionParams:
     
     # Model settings
     n_terms: int = 10  # Poisson series truncation
+    
+    # Sanity bounds (from research: gemeni.txt, grok.md)
+    MIN_SIGMA: float = 0.10  # Minimum 10% volatility
+    MAX_SIGMA: float = 2.00  # Maximum 200% volatility
+    MIN_LAMBDA: float = 0.0  # Minimum jump intensity
+    MAX_LAMBDA: float = 10.0 / 365  # Max 10 jumps/day
+    MIN_MU_J: float = -0.50  # Max -50% jump mean
+    MAX_MU_J: float = 0.50   # Max +50% jump mean
+    MIN_SIGMA_J: float = 0.001  # Min 0.1% jump std
+    MAX_SIGMA_J: float = 0.50   # Max 50% jump std
+    MAX_N_TERMS: int = 20  # Max Poisson terms for numerical stability
+    
+    def __post_init__(self):
+        """Validate and clamp parameters to sane bounds."""
+        original_values = {
+            'sigma': self.sigma,
+            'lambda_j': self.lambda_j,
+            'mu_j': self.mu_j,
+            'sigma_j': self.sigma_j,
+            'n_terms': self.n_terms,
+        }
+        
+        # Clamp to bounds
+        self.sigma = max(self.MIN_SIGMA, min(self.MAX_SIGMA, self.sigma))
+        self.lambda_j = max(self.MIN_LAMBDA, min(self.MAX_LAMBDA, self.lambda_j))
+        self.mu_j = max(self.MIN_MU_J, min(self.MAX_MU_J, self.mu_j))
+        self.sigma_j = max(self.MIN_SIGMA_J, min(self.MAX_SIGMA_J, self.sigma_j))
+        self.n_terms = max(1, min(self.MAX_N_TERMS, self.n_terms))
+        
+        # Log if any values were clamped
+        clamped = []
+        for name, orig in original_values.items():
+            current = getattr(self, name)
+            if current != orig:
+                clamped.append(f"{name}: {orig} -> {current}")
+        
+        if clamped:
+            logger.warning(
+                "JumpDiffusionParams clamped to bounds",
+                clamped=clamped,
+            )
     
     @classmethod
     def for_asset(cls, asset: str) -> "JumpDiffusionParams":
