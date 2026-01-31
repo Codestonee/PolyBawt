@@ -21,6 +21,12 @@ interface RiskState {
     // UI Configuration
     density: 'comfortable' | 'compact'
     setDensity: (density: 'comfortable' | 'compact') => void
+
+    // Strategy State
+    activeStrategies: Record<string, boolean>
+    setActiveStrategies: (strategies: Record<string, boolean>) => void
+    isSystemOnline: boolean
+    setSystemOnline: (online: boolean) => void
 }
 
 export const useRiskStore = create<RiskState>((set) => ({
@@ -38,4 +44,9 @@ export const useRiskStore = create<RiskState>((set) => ({
 
     density: 'comfortable',
     setDensity: (density) => set({ density }),
+
+    activeStrategies: {},
+    setActiveStrategies: (strategies) => set({ activeStrategies: strategies }),
+    isSystemOnline: false,
+    setSystemOnline: (online) => set({ isSystemOnline: online }),
 }))
