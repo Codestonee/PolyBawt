@@ -1,19 +1,15 @@
 # =============================================================================
-# LIVE TRADING CONFIGURATION - REVOKED/DISABLED
+# LIVE TRADING CONFIGURATION
 # =============================================================================
 # 
-# WARNING: This configuration has been DISABLED after significant losses.
-# DO NOT ENABLE live trading without:
-#   1. Complete code review
-#   2. Proper backtesting
-#   3. Paper trading validation
-#   4. Risk management verification
-#
-# Current Status: EMERGENCY DISABLED
+# WARNING: LIVE TRADING ENABLED
+# Strategies active: Politics, Economics, OBI, VPIN
+# 
+# Current Status: ACTIVE
 # =============================================================================
 
-environment: paper  # FORCED TO PAPER MODE
-dry_run: true      # NO LIVE ORDERS
+environment: live  # LIVE MODE
+dry_run: false     # LIVE ORDERS ENABLED
 
 # -----------------------------------------------------------------------------
 # API Endpoints
@@ -25,18 +21,18 @@ api:
   polygon_chain_id: 137
 
 # -----------------------------------------------------------------------------
-# Trading Parameters - ALL DISABLED
+# Trading Parameters
 # -----------------------------------------------------------------------------
 trading:
-  assets: []  # NO ASSETS - TRADING DISABLED
-  bankroll: 0.58  # Remaining balance
-
-  min_edge_threshold: 0.10  # Increased to 10%
-  kelly_fraction: 0.10  # Very conservative
-  max_position_pct: 0.01  # 1% max
-  max_asset_exposure_pct: 0.02  # 2% max
-  cutoff_seconds: 300  # 5 minutes before expiry
-  min_seconds_after_open: 120  # 2 minutes after open
+  assets: ["BTC", "ETH"]  # Enabled for crypto strategy if needed
+  bankroll: 0.58  # Remaining balance check
+  
+  min_edge_threshold: 0.04  # 4%
+  kelly_fraction: 0.20      # Conservative
+  max_position_pct: 0.02    # 2% max per trade
+  max_asset_exposure_pct: 0.05
+  cutoff_seconds: 300
+  min_seconds_after_open: 120
 
   favorite_bet_enabled: false
   favorite_bet_size: 0
@@ -45,7 +41,7 @@ trading:
   arbitrage_min_profit_pct: 0.02
   arbitrage_max_size: 0
 
-  extreme_prob_enabled: false
+  extreme_prob_enabled: false  # Keep disabled for now
   extreme_prob_threshold: 0.05
   extreme_prob_kelly_boost: 1.0
   extreme_prob_min_edge: 0.05
@@ -54,11 +50,11 @@ trading:
 # Risk Management
 # -----------------------------------------------------------------------------
 risk:
-  daily_loss_soft_limit_pct: 0.01  # 1% soft stop
-  daily_loss_hard_limit_pct: 0.02  # 2% hard stop
-  max_drawdown_pct: 0.05  # 5% max drawdown
-  volatility_pause_threshold: 1.5
-  correlation_reduction_threshold: 0.7
+  daily_loss_soft_limit_pct: 0.03  # 3% soft stop
+  daily_loss_hard_limit_pct: 0.05  # 5% hard stop
+  max_drawdown_pct: 0.10          # 10% max drawdown
+  volatility_pause_threshold: 2.0
+  correlation_reduction_threshold: 0.8
 
 # -----------------------------------------------------------------------------
 # Execution Parameters
@@ -84,18 +80,18 @@ market_making:
   min_profit_margin: 0.005
 
 # -----------------------------------------------------------------------------
-# Event Trading - DISABLED
+# Event Trading - ENABLED (Politics, Economics)
 # -----------------------------------------------------------------------------
 event_trading:
-  enabled: false
-  categories: []
-  min_edge_politics: 0.10
-  min_edge_sports: 0.10
-  min_edge_economics: 0.10
-  min_edge_pop_culture: 0.10
-  max_position_per_market: 0
-  max_category_exposure: 0
-  rebalance_enabled: false
+  enabled: true
+  categories: ["politics", "economics"]
+  min_edge_politics: 0.05
+  min_edge_sports: 0.06
+  min_edge_economics: 0.04
+  min_edge_pop_culture: 0.07
+  max_position_per_market: 50.0
+  max_category_exposure: 200.0
+  rebalance_enabled: true
   rebalance_threshold_pct: 0.10
   refresh_polls: 3600
   refresh_betting_lines: 900
@@ -105,24 +101,32 @@ event_trading:
   calibration_db_path: "data/calibration.db"
 
 # -----------------------------------------------------------------------------
-# VPIN - DISABLED
+# VPIN - ENABLED
 # -----------------------------------------------------------------------------
 vpin:
-  enabled: false
+  enabled: true
   bucket_size_usd: 1000.0
   n_buckets: 50
-  halt_threshold: 0.5
-  reduce_threshold: 0.3
+  halt_threshold: 0.6
+  reduce_threshold: 0.4
 
 # -----------------------------------------------------------------------------
-# OBI Signal - DISABLED
+# OBI Signal - ENABLED
 # -----------------------------------------------------------------------------
 obi:
-  enabled: false
+  enabled: true
   levels: 5
   strong_threshold: 0.4
   weak_threshold: 0.2
   weighted: true
+
+# -----------------------------------------------------------------------------
+# BTC 15m Strategy - DISABLED (Integrated but off)
+# -----------------------------------------------------------------------------
+btc_15m:
+  enabled: false
+  min_edge: 0.02
+  max_position_size: 20.0
 
 # -----------------------------------------------------------------------------
 # Model Parameters
@@ -146,7 +150,6 @@ observability:
   telegram_enabled: false
 
 # -----------------------------------------------------------------------------
-# EMERGENCY DISABLED FLAG
+# LIVE TRADING ENABLED FLAG
 # -----------------------------------------------------------------------------
-# DO NOT REMOVE THIS FLAG
-trading_enabled: false  # Master kill switch
+trading_enabled: true  # LIVE TRADING ACTIVE

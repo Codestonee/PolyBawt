@@ -121,6 +121,28 @@ class CLOBClient:
             logger.error("CLOB client initialization failed", error=str(e))
             return False
     
+    async def get_collateral_balance_usdc(self) -> float | None:
+        """Fetch collateral (USDC) balance via CLOB (Level 2 auth).
+
+        Returns:
+            float balance on success, or None if unavailable.
+        """
+        if not self._initialized or self._clob_client is None:
+            return None
+
+        try:
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            resp = await asyncio.to_thread(self._clob_client.get_balance_allowance, params)
+            from src.execution.balance import parse_usdc_balance
+
+            bal = parse_usdc_balance(resp)
+            return float(bal)
+        except Exception as e:
+            logger.warning("Failed to fetch collateral balance", error=str(e))
+            return None
+
     async def place_order(
         self,
         token_id: str,
@@ -207,8 +229,19 @@ class CLOBClient:
             order = self._clob_client.create_order(order_args)
             
             # Submit order
+            # Map order type to py-clob-client enum.
+            from py_clob_client.clob_types import OrderType as PMOrderType
+            ot = str(order_type).upper() if order_type else "GTC"
+            # Our internal OrderType supports IOC/FAK naming; Polymarket uses FAK.
+            if ot == "IOC":
+                ot = "FAK"
+            try:
+                pm_order_type = getattr(PMOrderType, ot)
+            except Exception:
+                pm_order_type = PMOrderType.GTC
+
             response = await asyncio.to_thread(
-                self._clob_client.post_order, order
+                self._clob_client.post_order, order, pm_order_type
             )
             
             if response and response.get("orderID"):

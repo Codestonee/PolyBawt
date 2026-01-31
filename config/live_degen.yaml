@@ -1,0 +1,69 @@
+environment: production
+
+dry_run: false
+
+api:
+  clob_base_url: "https://clob.polymarket.com"
+  gamma_base_url: "https://gamma-api.polymarket.com"
+  ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+  polygon_chain_id: 137
+
+trading:
+  assets: ["BTC", "ETH", "SOL", "XRP"]
+  bankroll: 50.0
+
+  # trade when there is real edge
+  min_edge_threshold: 0.04
+  kelly_fraction: 0.25
+
+  # caps
+  max_position_pct: 0.10          # $5 max bet
+  max_total_exposure_pct: 0.30    # $15 max total exposure
+  max_asset_exposure_pct: 0.30    # allow multiple assets; total cap is the real limiter
+
+  cutoff_seconds: 60
+  min_seconds_after_open: 30
+
+  # no forced favorites
+  favorite_bet_enabled: false
+
+  # degenerate spice: at most 1 vibe bet per hour
+  vibe_bet_enabled: true
+  vibe_bet_cooldown_seconds: 3600
+  vibe_bet_size: 5.00
+
+  # keep arb OFF in degen mode unless you explicitly want it
+  arbitrage_enabled: false
+
+  # execution hygiene
+  gtc_max_spread: 0.02
+  gtc_max_spread_bps: 400
+
+  min_order_size_usd: 5.0
+
+  # literal wallet balance floor
+  min_balance_usd: 20.0
+  balance_check_interval_seconds: 30
+
+risk:
+  # stop when balance < $20  => -60% from $50
+  daily_loss_hard_limit_pct: 0.60
+  max_drawdown_pct: 0.60
+
+  # soft pause near $25
+  daily_loss_soft_limit_pct: 0.50
+
+execution:
+  rate_limit_buffer_pct: 0.15
+  ws_reconnect_initial_ms: 100
+  ws_reconnect_max_ms: 5000
+  ws_reconnect_multiplier: 2.0
+  ws_reconnect_jitter: 0.2
+  order_timeout_ms: 5000
+  max_retries: 3
+
+observability:
+  log_level: INFO
+  log_format: clean
+  metrics_port: 9090
+  telegram_enabled: false

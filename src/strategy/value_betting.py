@@ -201,6 +201,8 @@ class ValueBettingStrategy:
         
         # State
         self.metrics = StrategyMetrics()
+        self._last_vibe_bet_at: float = 0.0
+        self._last_balance_check_at: float = 0.0
         self._running = False
         self._last_reconciliation = 0.0
         self._reconciliation_interval = 60.0  # FIX #10: Reconcile every 60s
@@ -496,6 +498,19 @@ class ValueBettingStrategy:
         if not signal.is_actionable:
             return False
 
+        # Global exposure cap (safety): do not exceed configured fraction of bankroll.
+        max_total = getattr(self.config.trading, "max_total_exposure_pct", 1.0) * self.kelly_sizer.bankroll
+        effective = self._effective_exposure_usd()
+        if effective + signal.kelly_size > max_total:
+            logger.info(
+                "Skipping trade - max total exposure reached",
+                asset=signal.market.asset,
+                current_exposure=effective,
+                attempted_add=signal.kelly_size,
+                max_total=max_total,
+            )
+            return False
+
         # FIX: Enforce 1 bet per market limit
         if signal.market.question in self._traded_markets:
             logger.info("Skipping trade - already traded this market", asset=signal.market.asset)
@@ -520,12 +535,20 @@ class ValueBettingStrategy:
         # Get execution price
         price = await self._get_execution_price(token_id, signal.side, signal.market)
         
+        # Enforce minimum order size
+        min_size = float(getattr(self.config.trading, "min_order_size_usd", 0.0))
+        if min_size > 0 and signal.kelly_size < min_size:
+            logger.info("Skipping trade - below minimum order size", size=signal.kelly_size, min_size=min_size)
+            return False
+
         # Create order
+        order_type = await self._select_order_type(token_id)
         order = self.order_manager.create_order(
             token_id=token_id,
             side=order_side,
             price=price,
             size=signal.kelly_size,
+            order_type=order_type,
             strategy_id="value_betting",
         )
         
@@ -818,8 +841,9 @@ class ValueBettingStrategy:
             fill_size: Size filled in this event
             fill_price: Price of this fill
         """
-        # Forward to OrderManager
-        self.order_manager.handle_fill(client_order_id, fill_size, fill_price)
+        # Forward to OrderManager (OrderManager tracks size in USD; fills arrive in shares)
+        fill_usd = float(fill_size) * float(fill_price)
+        self.order_manager.handle_fill(client_order_id, fill_usd, fill_price)
         
         # Check if we have metadata for this order
         metadata = self._pending_fills.get(client_order_id)
@@ -1108,7 +1132,99 @@ class ValueBettingStrategy:
             kelly_size=f"{signal.kelly_size:.2f}",
         )
 
-    async def _place_favorite_fallback(self, market: Market) -> None:
+    async def _check_balance_floor(self) -> None:
+        """Hard-stop live trading if wallet balance drops below configured floor."""
+        if self.config.dry_run:
+            return
+        if not self.clob_client:
+            return
+
+        min_bal = float(getattr(self.config.trading, "min_balance_usd", 0.0))
+        if min_bal <= 0:
+            return
+
+        interval = float(getattr(self.config.trading, "balance_check_interval_seconds", 30))
+        now = time.time()
+        if (now - self._last_balance_check_at) < interval:
+            return
+        self._last_balance_check_at = now
+
+        bal = await self.clob_client.get_collateral_balance_usdc()
+        if bal is None:
+            # Can't read balance; don't halt on missing data.
+            return
+
+        if bal < min_bal:
+            logger.critical("BALANCE FLOOR HIT - halting trading", balance=bal, min_balance=min_bal)
+            self.circuit_breaker.manual_halt()
+            self._running = False
+
+    async def _select_order_type(self, token_id: str) -> OrderType:
+        """Pick an order type based on spread (execution hygiene)."""
+        if not self.clob_client:
+            return OrderType.GTC
+
+        max_spread_abs = float(getattr(self.config.trading, "gtc_max_spread", 0.0))
+        max_spread_bps = float(getattr(self.config.trading, "gtc_max_spread_bps", 0.0))
+        if max_spread_abs <= 0 and max_spread_bps <= 0:
+            return OrderType.GTC
+
+        try:
+            book = await self._get_cached_order_book(token_id)
+            if book.best_bid is None or book.best_ask is None:
+                return OrderType.GTC
+
+            bid = float(book.best_bid)
+            ask = float(book.best_ask)
+            spread = ask - bid
+            mid = (ask + bid) / 2.0 if (ask + bid) > 0 else 0.0
+
+            if max_spread_bps > 0 and mid > 0:
+                spread_bps = (spread / mid) * 10_000.0
+                if spread_bps > max_spread_bps:
+                    return OrderType.IOC
+
+            if max_spread_abs > 0 and spread > max_spread_abs:
+                return OrderType.IOC
+
+        except Exception:
+            pass
+
+        return OrderType.GTC
+
+    def _can_vibe_bet(self) -> bool:
+        cooldown = float(getattr(self.config.trading, "vibe_bet_cooldown_seconds", 3600))
+        return (time.time() - self._last_vibe_bet_at) >= cooldown
+
+    async def _place_vibe_bet(self, market: Market) -> None:
+        """Place an occasional small bet even without edge.
+
+        Bounded by:
+        - one bet per cooldown window
+        - max_total_exposure_pct (global)
+        - max_position_pct (per trade)
+        - circuit breaker + toxicity checks inside order path
+        """
+        if not self._can_vibe_bet():
+            return
+
+        size = float(getattr(self.config.trading, "vibe_bet_size", 5.0))
+        if size <= 0:
+            return
+
+        logger.info("VIBE BET: letting the lizard brain have one", size_usd=size)
+        self._last_vibe_bet_at = time.time()
+        await self._place_favorite_fallback(market, override_size=size)
+
+    def _pending_exposure_usd(self) -> float:
+        """Conservative exposure estimate for orders submitted but not yet reflected in Portfolio."""
+        return float(sum(p.size_usd for p in self._pending_fills.values()))
+
+    def _effective_exposure_usd(self) -> float:
+        """Exposure including pending submitted orders (conservative)."""
+        return float(self.portfolio.total_exposure) + self._pending_exposure_usd()
+
+    async def _place_favorite_fallback(self, market: Market, override_size: float | None = None) -> None:
         """
         Place a minimum bet on the most likely outcome (favorite).
 
@@ -1135,7 +1251,25 @@ class ValueBettingStrategy:
             logger.info("Circuit breaker blocking favorite fallback bet")
             return
 
-        bet_size = self.config.trading.favorite_bet_size
+        bet_size = float(override_size) if override_size is not None else float(self.config.trading.favorite_bet_size)
+
+        # Enforce minimum order size
+        min_size = float(getattr(self.config.trading, "min_order_size_usd", 0.0))
+        if min_size > 0 and bet_size < min_size:
+            logger.info("Skipping fallback/vibe - below minimum order size", size=bet_size, min_size=min_size)
+            return
+
+        # Enforce max total exposure (global)
+        max_total = getattr(self.config.trading, "max_total_exposure_pct", 1.0) * self.kelly_sizer.bankroll
+        effective = self._effective_exposure_usd()
+        if effective >= max_total:
+            logger.info("Skipping favorite fallback - max total exposure reached", effective_exposure=effective, max_total=max_total)
+            return
+        # If the bet would push us over, clip to remaining room (and bail if too small)
+        room = max_total - effective
+        bet_size = min(bet_size, room)
+        if bet_size <= 0:
+            return
 
         # Enforce max asset exposure
         exposure_by_asset = self.portfolio.get_exposure_by_asset()
@@ -1161,12 +1295,13 @@ class ValueBettingStrategy:
 
         # Place actual order
         try:
+            order_type = await self._select_order_type(token_id)
             order = self.order_manager.create_order(
                 token_id=token_id,
                 side=OrderSide.BUY,
                 price=favorite_price,
                 size=bet_size,
-                order_type=OrderType.GTC,
+                order_type=order_type,
             )
 
             success = await self.order_manager.submit_order(order)
@@ -1214,6 +1349,9 @@ class ValueBettingStrategy:
         # FIX #10: Periodic order reconciliation
         await self._reconcile_orders()
         
+        # Live balance floor check (literal wallet USDC)
+        await self._check_balance_floor()
+
         # Check circuit breakers
         if not self.circuit_breaker.can_trade():
             logger.warning("Trading halted by circuit breaker")
@@ -1235,14 +1373,25 @@ class ValueBettingStrategy:
         await self._scan_for_arbitrage(markets)
         
         # STEP 2: Directional Trades (with favorite fallback)
+        vibe_used = False
         for market in markets:
             spot_price = prices.get(market.asset)
             if spot_price is not None:
                 trade_placed = await self._process_directional_trade(market, spot_price)
-                
+
                 # STEP 3: Favorite Fallback Bet (if no value trade placed)
                 if not trade_placed and self.config.trading.favorite_bet_enabled:
                     await self._place_favorite_fallback(market)
+
+                # STEP 4: Optional vibe bet (at most one per cooldown window)
+                if (
+                    not trade_placed
+                    and not vibe_used
+                    and getattr(self.config.trading, "vibe_bet_enabled", False)
+                    and self._can_vibe_bet()
+                ):
+                    await self._place_vibe_bet(market)
+                    vibe_used = True
 
         # Update API state snapshot
         try:

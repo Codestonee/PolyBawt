@@ -13,7 +13,7 @@ from typing import Any
 
 import yaml
 from pydantic import BaseModel, Field, field_validator
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class APIConfig(BaseModel):
@@ -34,6 +34,7 @@ class TradingConfig(BaseModel):
     kelly_fraction: float = 0.25  # 1/4 Kelly
     max_position_pct: float = 0.02  # 2% per trade
     max_asset_exposure_pct: float = 0.05  # 5% per asset
+    max_total_exposure_pct: float = 0.30  # Total exposure cap across all assets (fraction of bankroll)
     cutoff_seconds: int = 60  # Stop trading before expiry
     min_seconds_after_open: int = 30  # Avoid opening volatility
 
@@ -44,6 +45,23 @@ class TradingConfig(BaseModel):
     # Favorite fallback betting
     favorite_bet_enabled: bool = True
     favorite_bet_size: float = 2.00  # USD
+
+    # Optional "vibe bet" mode: allow an occasional small bet even without edge.
+    # Still bounded by max_position_pct and max_total_exposure_pct.
+    vibe_bet_enabled: bool = False
+    vibe_bet_cooldown_seconds: int = 3600
+    vibe_bet_size: float = 5.00  # USD (Polymarket minimum is often $5)
+
+    # Execution hygiene
+    gtc_max_spread: float = 0.02  # absolute spread; kept for backward compatibility
+    gtc_max_spread_bps: float = 0.0  # if >0, prefer IOC when spread/mid exceeds this
+
+    # Order sizing
+    min_order_size_usd: float = 5.0
+
+    # Balance floor (live trading)
+    min_balance_usd: float = 20.0
+    balance_check_interval_seconds: int = 30
     
     # Arbitrage trading
     arbitrage_enabled: bool = True
@@ -187,10 +205,15 @@ class ObservabilityConfig(BaseModel):
 
 
 class SecretsConfig(BaseSettings):
-    """
-    Secrets loaded exclusively from environment variables.
+    """Secrets loaded exclusively from environment variables.
+
     Never logged or persisted.
     """
+
+    model_config = SettingsConfigDict(
+        env_prefix="",  # Use exact env var names
+        case_sensitive=False,
+    )
 
     polymarket_private_key: str = ""
     polymarket_api_key: str = ""
@@ -202,10 +225,6 @@ class SecretsConfig(BaseSettings):
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     redis_url: str = "redis://localhost:6379/0"
-
-    class Config:
-        env_prefix = ""  # Use exact env var names
-        case_sensitive = False
 
 
 class AppConfig(BaseModel):

@@ -28,6 +28,7 @@ from src.execution.clob_client import CLOBClient
 from src.risk.circuit_breaker import CircuitBreaker
 from src.strategy.value_betting import ValueBettingStrategy
 from src.strategy.event_betting import EventBettingStrategy
+from src.strategy.btc_15m import BTC15mStrategy
 from src.portfolio.tracker import Portfolio
 from src.ingestion.event_market_discovery import EventMarketDiscovery
 
@@ -250,6 +251,38 @@ async def run_event_strategy(config: AppConfig) -> None:
         )
 
 
+async def run_btc15m_strategy(config: AppConfig) -> None:
+    """Initialize and run the BTC 15m strategy."""
+    logger = get_logger(__name__)
+    
+    # Check if enabled in config
+    if not getattr(config, 'btc_15m', {}).get('enabled', False):
+         logger.info("BTC 15m strategy disabled")
+         return
+
+    logger.info("Initializing BTC 15m strategy")
+    
+    rate_limiter = RateLimiter()
+    clob_client = CLOBClient(
+        dry_run=config.dry_run,
+        rate_limiter=rate_limiter,
+    )
+    await clob_client.initialize()
+    
+    strategy = BTC15mStrategy(
+        config=config,
+        clob_client=clob_client,
+    )
+    
+    try:
+        logger.info("Starting BTC 15m strategy")
+        await strategy.run()
+    except asyncio.CancelledError:
+        logger.info("BTC 15m strategy task cancelled")
+    except Exception as e:
+        logger.exception("BTC 15m strategy crashed", error=str(e))
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -379,6 +412,7 @@ async def async_main() -> None:
         # Run both strategies concurrently
         crypto_task = asyncio.create_task(run_crypto_strategy(config))
         event_task = asyncio.create_task(run_event_strategy(config))
+        btc_15m_task = asyncio.create_task(run_btc15m_strategy(config))
         
         # Monitor for kill switch in parallel
         async def kill_switch_monitor():
@@ -387,6 +421,7 @@ async def async_main() -> None:
                     logger.critical("Kill switch detected - stopping strategies")
                     crypto_task.cancel()
                     event_task.cancel()
+                    btc_15m_task.cancel()
                     break
                 await asyncio.sleep(1.0)
         
@@ -397,6 +432,7 @@ async def async_main() -> None:
         await asyncio.gather(
             crypto_task, 
             event_task, 
+            btc_15m_task,
             monitor_task, 
             return_exceptions=True
         )
