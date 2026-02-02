@@ -26,7 +26,7 @@ from src.execution.order_manager import OrderManager
 from src.execution.rate_limiter import RateLimiter
 from src.execution.clob_client import CLOBClient
 from src.risk.circuit_breaker import CircuitBreaker, CircuitBreakerConfig
-from src.strategy.value_betting import ValueBettingStrategy
+from src.strategy.value_betting import EnsembleStrategy
 from src.strategy.event_betting import EventBettingStrategy
 from src.strategy.btc_15m import BTC15mStrategy
 from src.portfolio.tracker import Portfolio
@@ -112,7 +112,7 @@ async def run_crypto_strategy(config: AppConfig) -> None:
     get_state().portfolio = portfolio
 
     # Create strategy
-    strategy = ValueBettingStrategy(
+    strategy = EnsembleStrategy(
         config=config,
         market_discovery=market_discovery,
         oracle=oracle,

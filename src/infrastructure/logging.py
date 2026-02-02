@@ -313,7 +313,13 @@ class CleanConsoleRenderer:
         time_str = datetime.now().strftime("%H:%M:%S")
         
         # Final Format: [12:00:00] 🚀 Message
-        return f"\033[90m[{time_str}]\033[0m {emoji} {message}"
+        formatted = f"\033[90m[{time_str}]\033[0m {emoji} {message}"
+        
+        # Append exception info if available
+        if event_dict.get("exception"):
+            formatted += f"\n{event_dict['exception']}"
+            
+        return formatted
 
 
 def get_logger(name: str) -> structlog.BoundLogger:

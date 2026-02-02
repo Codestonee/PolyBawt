@@ -116,21 +116,87 @@ class PendingFill:
     expires_at: float
 
 
-class ValueBettingStrategy:
+@dataclass
+class TradeSignal:
+    """A potential trade opportunity."""
+    
+    market: Market
+    side: TradeSide
+    model_prob: float
+    market_price: float
+    ev_result: EVResult
+    kelly_size: float
+    passes_gate: bool
+    rejection_reason: str = ""
+    strategy_name: str = "Unknown"  # NEW: Track which strategy generated this
+    
+    @property
+    def is_actionable(self) -> bool:
+        return self.passes_gate and self.kelly_size is not None and self.kelly_size > 0
+
+
+@dataclass
+class StrategyMetrics:
+    """Trading metrics for Brier score and performance tracking."""
+    
+    # Brier score components
+    predictions: list[tuple[float, bool]] = field(default_factory=list)  # (prob, outcome)
+    
+    # Trade counts
+    signals_generated: int = 0
+    signals_passed_gate: int = 0
+    orders_placed: int = 0
+    orders_filled: int = 0
+    
+    # PnL
+    realized_pnl: float = 0.0
+    unrealized_pnl: float = 0.0
+    
+    @property
+    def brier_score(self) -> float:
+        """
+        Calculate Brier score (lower is better).
+        
+        Brier = (1/N) Σ (p_i - o_i)²
+        where p_i is prediction and o_i is outcome (0 or 1)
+        """
+        if not self.predictions:
+            return 0.0
+        
+        total = sum((p - (1 if o else 0)) ** 2 for p, o in self.predictions)
+        return total / len(self.predictions)
+    
+    def add_prediction(self, probability: float, outcome: bool) -> None:
+        """Record a prediction and its outcome for Brier score."""
+        self.predictions.append((probability, outcome))
+
+
+@dataclass
+class PendingFill:
+    """Metadata for an order that has been submitted but not yet filled."""
+    token_id: str
+    asset: str
+    side: PositionSide
+    price: float
+    size_usd: float
+    market_question: str
+    expires_at: float
+
+
+class EnsembleStrategy:
     """
-    Value betting strategy for 15-minute markets.
+    Orchestrator for the Grok Strategy Ensemble.
     
-    Flow:
-    1. Discover active 15m markets
-    2. Get oracle prices
-    3. Calculate model probabilities
-    4. Evaluate EV and check NO-TRADE gate
-    5. Size positions with Kelly
-    6. Execute trades
+    Manages:
+    1. ArbTakerStrategy (Risk-free arb)
+    2. LatencySnipeStrategy (Offensive lag snipe)
+    3. SpreadMakerStrategy (Passive spread capture)
+    4. LeggedHedgeStrategy (Crash & catch)
     
-    Usage:
-        strategy = ValueBettingStrategy(config, ...)
-        await strategy.run()
+    Responsibility:
+    - Discovery & Data Feed
+    - Global Risk Gates (Daily Loss, Max Exposure)
+    - Execution
     """
     
     def __init__(
@@ -141,8 +207,8 @@ class ValueBettingStrategy:
         order_manager: OrderManager,
         rate_limiter: RateLimiter,
         circuit_breaker: CircuitBreaker,
-        clob_client: CLOBClient | None = None,  # FIX #3: For order book pricing
-        portfolio: Portfolio | None = None,  # FIX #4: For fill-based tracking
+        clob_client: CLOBClient | None = None,
+        portfolio: Portfolio | None = None,
         bankroll: float = 100.0,
     ):
         self.config = config
@@ -152,23 +218,10 @@ class ValueBettingStrategy:
         self.rate_limiter = rate_limiter
         self.circuit_breaker = circuit_breaker
         self.clob_client = clob_client
-        
-        # FIX #4: Portfolio for fill-based exposure tracking
         self.portfolio = portfolio or Portfolio(starting_capital=bankroll)
-        self._pending_fills: dict[str, PendingFill] = {}  # client_order_id -> PendingFill
+        self._pending_fills: dict[str, PendingFill] = {}
         
-        # Models
-        # self.pricing_model = JumpDiffusionModel()  # OLD
-        self.pricing_model = MertonJDCalibrator()  # NEW: Research model
-        
-        self.ev_calculator = EVCalculator()
-        self.no_trade_gate = NoTradeGate(GateConfig(
-            min_edge_threshold=config.trading.min_edge_threshold,
-            min_seconds_to_expiry=config.trading.cutoff_seconds,
-            min_seconds_after_open=config.trading.min_seconds_after_open,
-        ))
-        
-        # Risk
+        # Risk & Sizing
         self.kelly_sizer = KellySizer(
             bankroll=bankroll,
             kelly_fraction=config.trading.kelly_fraction,
@@ -176,407 +229,206 @@ class ValueBettingStrategy:
             max_asset_exposure_pct=config.trading.max_asset_exposure_pct,
         )
         self.correlation_matrix = CorrelationMatrix()
+
+        self.ev_calculator = EVCalculator()
+        self.no_trade_gate = NoTradeGate(GateConfig(
+            min_edge_threshold=config.trading.min_edge_threshold,
+            min_seconds_to_expiry=getattr(config.trading, "cutoff_seconds", 300),
+            min_seconds_after_open=config.trading.min_seconds_after_open,
+        ))
+
+        # Utilities
+        self.arbitrage_detector = ArbitrageDetector(fee_rate=0.02)
         
-        # Research-based enhancements from arXiv:2510.15205
-        self.arbitrage_detector = ArbitrageDetector(
-            fee_rate=0.02,  # Polymarket 2% fee
-            min_profit_threshold=0.005,  # 0.5% minimum profit after fees
+        # Modular Strategies
+        from src.strategy.strategies import (
+            ArbTakerStrategy, LatencySnipeStrategy, 
+            SpreadMakerStrategy, LeggedHedgeStrategy
         )
-        self.toxicity_filter = ToxicityFilter(
-            imbalance_threshold=0.7,  # 70% imbalance is toxic
-            spread_threshold=0.08,     # 8% spread is too wide
-            min_depth_usd=20.0,        # Minimum $20 liquidity (lowered for more trades)
-            vpin_threshold=0.7,        # VPIN > 0.7 = extremely toxic (research)
-        )
-        
-        # Research-backed enhancements (2026 deep research synthesis)
-        self.ensemble_model = ResearchEnsembleModel()  # Combines JD + Kou + Bates + order book
-        self.orderbook_signal = OrderBookSignalModel()  # Order book imbalance (65-75% accuracy)
-        # self.sentiment_integrator = SentimentIntegrator()  # OLD
-        self.sentiment_aggregator = SentimentAggregator() # NEW: From research
-        self._vpin_calculators: dict[str, VPINCalculator] = {}  # Per-market VPIN tracking
-        
-        # WebSocket Client (Research)
-        self.ws_client = None
+        self.strategies = [
+            ArbTakerStrategy(config, self.arbitrage_detector),
+            LatencySnipeStrategy(config, oracle),
+            SpreadMakerStrategy(config),
+            LeggedHedgeStrategy(config),
+        ]
         
         # State
         self.metrics = StrategyMetrics()
-        self._last_vibe_bet_at: float = 0.0
-        self._last_balance_check_at: float = 0.0
-        self._running = False
-        self._last_reconciliation = 0.0
-        self._reconciliation_interval = 60.0  # FIX #10: Reconcile every 60s
-        
-        # FIX: Order book cache to avoid duplicate fetches per iteration
-        self._order_book_cache: dict[str, "OrderBook"] = {}  # token_id -> OrderBook
-        
-        # FIX: Track traded markets to enforce "1 bet per asset per cycle" (User Request)
-        # Map: market.question -> expiry_timestamp
         self._traded_markets: dict[str, float] = {}
-
-        # RESEARCH FIX: Sniper protection - register callback for Chainlink price divergence
+        self._order_book_cache: dict[str, "OrderBook"] = {}
+        self.ws_client = None
+        self._sniper_alert_active: dict[str, SniperAlert] = {}
         self.oracle.register_sniper_callback(self._handle_sniper_alert)
-        self._sniper_alert_active: dict[str, SniperAlert] = {}  # asset -> active alert
-
-        # Extreme probability settings (where fees approach zero)
-        self._extreme_prob_enabled = config.trading.extreme_prob_enabled
-        self._extreme_prob_threshold = config.trading.extreme_prob_threshold
-        self._extreme_prob_kelly_boost = config.trading.extreme_prob_kelly_boost
-        self._extreme_prob_min_edge = config.trading.extreme_prob_min_edge
+        
+        # VPIN / Toxicity (Research)
+        self._vpin_calculators: dict[str, VPINCalculator] = {}
 
     async def _init_websocket(self):
         """Initialize and connect WebSocket client."""
         if not self.ws_client:
             self.ws_client = await create_market_ws_client()
             await self.ws_client.connect()
-            logger.info("WebSocket initialized for strategy")
+            logger.info("WebSocket initialized for ensemble strategy")
 
-    def _is_extreme_probability(self, market: Market) -> bool:
-        """
-        Check if market is at extreme probability (near 0% or 100%).
-
-        At extremes, fees approach zero:
-        - Fee at p=0.01 → $0.0025 per 100 shares
-        - Fee at p=0.50 → $1.56 per 100 shares (62x more!)
-
-        This allows larger positions and lower edge thresholds.
-        """
-        if not self._extreme_prob_enabled:
-            return False
-        threshold = self._extreme_prob_threshold
-        return market.yes_price < threshold or market.yes_price > (1 - threshold)
-
-    def _get_min_edge_for_market(self, market: Market) -> float:
-        """Get minimum edge threshold, lower at extreme probabilities."""
-        if self._is_extreme_probability(market):
-            return self._extreme_prob_min_edge
-        return self.config.trading.min_edge_threshold
-
-    async def analyze_market(
-        self,
-        market: Market,
-        spot_price: float,
-    ) -> TradeSignal | None:
-        """
-        Analyze a single market for trading opportunity.
+    async def run(self):
+        """Main strategy loop."""
+        self._running = True
+        logger.info("Starting Ensemble Strategy loop...")
+        await self._init_websocket()
         
-        Args:
-            market: Market to analyze
-            spot_price: Current spot price for the asset
-        
-        Returns:
-            TradeSignal if opportunity found, None otherwise
-        """
-        # Calculate model probability using Research Code (MertonJD)
-        # Note: In a real implementation, we would calibrate this first
-        # For now, we assume params are reasonable or will be calibrated
-        
-        # NOTE: self.pricing_model (MertonJDCalibrator) handles calibration
-        # We need historical returns for it. For now, let's use the Ensemble model 
-        # which incorporates it, or fallback to simple heuristics if calibration missing.
-        
-        time_years = market.minutes_to_expiry / (365 * 24 * 60) # Approx
+        while self._running:
+            try:
+                # 1. Update Market Scope (15m BTC/ETH/SOL/XRP)
+                markets = await self.market_discovery.get_active_markets(
+                    assets=self.config.trading.assets
+                )
+                
+                # Filter for 15-min markets specifically if needed, 
+                # or trust discovery returns what we asked for.
+                # Grok: "Filter '15 min' in title"
+                
+                # 2. Cycle Markets
+                for market in markets:
+                    # Refresh Risk State
+                    if not self.circuit_breaker.can_trade():
+                        logger.warning("Circuit breaker active - skipping scan")
+                        break
+                        
+                    await self.process_market(market)
+                    
+                    # Jitter to avoid bot-like patterns
+                    # Grok: "Poll every 1-3s jittered"
+                    await asyncio.sleep(random.uniform(0.1, 0.5)) 
 
-        # FIX #1: Use market.open_price if available, else fall back to spot
-        if market.open_price is not None:
-            initial_price = market.open_price
-        else:
-            # Fallback: use current spot price (suboptimal but safe)
-            initial_price = spot_price
-            logger.warning(
-                "Using spot price as initial (open_price not available)",
-                asset=market.asset,
-                question=market.question[:50],
-            )
+                # Cleanup
+                self._cleanup_traded_markets()
+                
+                # Main Loop Sleep
+                await asyncio.sleep(1.0)
+                
+            except Exception as e:
+                logger.error("Error in ensemble loop", error=str(e))
+                await asyncio.sleep(5.0)
 
-        # RESEARCH ENHANCEMENT: Use ensemble model with order book features
-        # Combines JD + Kou + Bates + order book imbalance signals
-        orderbook_features = None
-        vpin = None
-        
-        # FIX #3: Fetch order book for spread, depth, and signal analysis
-        spread = 0.0
-        book_depth_usd = 1000.0  # Default fallback
+    async def process_market(self, market: Market):
+        """Process a single market across all strategies."""
+        # 1. Fetch Data (Oracle, Book)
+        spot_price = self.oracle.get_price(market.asset)
+        if spot_price is None:
+            return
+
         book = None
-        
-        # Use WebSocket for orderbook if available (faster!)
-        if self.ws_client and self.ws_client.is_connected:
-             ws_book_data = self.ws_client.get_orderbook(market.yes_token_id)
-             if ws_book_data:
-                 # Adapt WS format to OrderBook object expected by signals
-                 # This is a simplification; ideally we'd map fields properly
-                 pass 
-
         if self.clob_client:
             try:
-                # Fetch order book for YES token (primary analysis)
+                # Cache book
                 token_id = market.yes_token_id
                 book = await self._get_cached_order_book(token_id)
-
-                spread = book.spread
-                book_depth_usd = book.ask_depth_usd
-                
-                # Extract order book features for ensemble model
-                orderbook_features = self.orderbook_signal.extract_features(
-                    orderbook=book,
-                    market_state={
-                        "seconds_to_expiry": market.seconds_to_expiry,
-                        "vpin": vpin,
-                    },
-                )
-                
-                # Get VPIN if we have a calculator for this market
-                if token_id not in self._vpin_calculators:
-                    self._vpin_calculators[token_id] = VPINCalculator()
-                
-                # Feed trades to VPIN calculator (if we had trade stream)
-                # self._vpin_calculators[token_id].add_trade(...) 
-                
-                vpin = self._vpin_calculators[token_id].calculate_vpin()
-                
-                logger.debug(
-                    "Order book analyzed",
-                    token_id=token_id[:20] + "...",
-                    spread=spread,
-                    depth_usd=book_depth_usd,
-                    imbalance=orderbook_features.imbalance_100bp if orderbook_features else 0,
-                    vpin=vpin,
-                )
             except Exception as e:
-                logger.warning("Failed to fetch order book", error=str(e), token_id=market.yes_token_id)
-
-        # RESEARCH: Ensemble model probability (JD + Kou + Bates + order book)
-        ensemble_result = self.ensemble_model.prob_up(
-            spot=spot_price,
-            initial=initial_price,
-            time_years=time_years,
-            asset=market.asset,
-            orderbook_features=orderbook_features,
-            vpin=vpin,
-        )
-        model_prob = ensemble_result.probability
+                logger.debug("Failed to fetch book", asset=market.asset)
         
-        logger.debug(
-            "Ensemble model used",
-            asset=market.asset,
-            jd=f"{ensemble_result.jd_prob:.3f}",
-            kou=f"{ensemble_result.kou_prob:.3f}",
-            bates=f"{ensemble_result.bates_prob:.3f}",
-            orderbook_adj=f"{ensemble_result.orderbook_adjustment:.3f}",
-            final=f"{model_prob:.3f}",
-            regime=ensemble_result.regime.value,
-            confidence=f"{ensemble_result.confidence:.2f}",
-        )
-        
-        # Calculate EV
-        ev_result = self.ev_calculator.calculate(
-            model_prob=model_prob,
-            market_price=market.yes_price,
-            size_usd=10.0,  # Placeholder, Kelly will override
-        )
-        
-        self.metrics.signals_generated += 1
-
-        # Determine token_id for the side we'd trade
-        token_id = market.yes_token_id if ev_result.side == TradeSide.BUY_YES else market.no_token_id
-        
-        # Try to fetch order book for the specific side if not already done
-        if book is None and self.clob_client:
-            try:
-                book = await self._get_cached_order_book(token_id)
-                spread = book.spread
-                book_depth_usd = book.ask_depth_usd if ev_result.side in (TradeSide.BUY_YES, TradeSide.BUY_NO) else book.bid_depth_usd
-            except Exception as e:
-                logger.warning("Failed to fetch order book", error=str(e), token_id=token_id)
-
-        # Check NO-TRADE gate
-        # Use lower edge threshold for extreme probability markets (fees approach zero)
+        # 2. Build Context
+        from src.strategy.base import TradeContext
         context = TradeContext(
-            ev_result=ev_result,
-            asset=market.asset,
-            token_id=market.yes_token_id,
-            seconds_to_expiry=market.seconds_to_expiry,
-            seconds_since_open=market.seconds_since_open,  # FIX #9: Now populated from market
-            spread=spread,  # FIX #3: Real spread from order book
-            book_depth_usd=book_depth_usd,  # FIX #3: Real depth from order book
-            oracle_age_seconds=self.oracle.get_cached_price(market.asset).age_seconds if self.oracle.get_cached_price(market.asset) is not None else 9999,
-            rate_limit_usage_pct=self.rate_limiter.order_usage_pct(),
-            trading_halted=not self.circuit_breaker.can_trade(),
-            correlation_with_portfolio=self.correlation_matrix.max_correlation_with(
-                market.asset, self.portfolio.get_exposure_by_asset()
-            ),
-            override_min_edge=self._get_min_edge_for_market(market),  # Lower at extremes
-        )
-        
-        gate_result = self.no_trade_gate.evaluate(context)
-        
-        # Calculate Kelly size
-        kelly_result = self.kelly_sizer.calculate(
-            win_prob=model_prob if ev_result.side == TradeSide.BUY_YES else 1 - model_prob,
-            market_price=market.yes_price if ev_result.side == TradeSide.BUY_YES else 1 - market.yes_price,
-            side="YES" if ev_result.side == TradeSide.BUY_YES else "NO",
-            current_asset_exposure=self.portfolio.get_exposure_by_asset().get(market.asset, 0),
-        )
-        
-        # Apply correlation adjustment
-        corr_adj = self.correlation_matrix.correlation_adjustment(
-            market.asset, self.portfolio.get_exposure_by_asset()
-        )
-        
-        # Sentiment-based sizing multiplier (NOT probability adjustment!)
-        # SAFETY: Disabled by default because this code previously used placeholders.
-        sentiment_mult = 1.0
-        if getattr(self.config.trading, "sentiment_sizing_enabled", False):
-            # TODO: Replace placeholders with real inputs (e.g. funding rate + real OBI volumes)
-            market_state_sentiment = type('obj', (object,), {
-                'asset': market.asset,
-                'funding_rate': 0.0001,  # placeholder
-                'bid_volume_5bp': 1000,  # placeholder
-                'ask_volume_5bp': 1000,  # placeholder
-            })
-
-            sentiment_score = self.sentiment_aggregator.composite_sentiment_score(market_state_sentiment)
-            base_fraction = self.config.trading.kelly_fraction
-            adjusted_fraction = self.sentiment_aggregator.adjust_position_sizing(base_fraction, sentiment_score)
-            sentiment_mult = adjusted_fraction / base_fraction if base_fraction > 0 else 1.0
-
-        # EXTREME PROBABILITY BOOST: Fees approach zero at p < 5% or p > 95%
-        # Research: Fee at p=0.01 is $0.0025 vs $1.56 at p=0.50 (62x less!)
-        extreme_prob_mult = 1.0
-        if self._is_extreme_probability(market):
-            extreme_prob_mult = self._extreme_prob_kelly_boost
-            logger.info(
-                "Extreme probability detected - boosting position",
-                asset=market.asset,
-                yes_price=f"{market.yes_price:.2f}",
-                boost=f"{extreme_prob_mult:.1f}x",
-            )
-
-        # Final adjusted size = base × correlation × sentiment × extreme_boost
-        adjusted_size = kelly_result.recommended_size_usd * corr_adj * sentiment_mult * extreme_prob_mult
-        
-        logger.debug(
-            "Position sizing",
-            kelly_base=f"${kelly_result.recommended_size_usd:.2f}",
-            corr_adj=f"{corr_adj:.2f}",
-            sentiment_mult=f"{sentiment_mult:.2f}",
-            final_size=f"${adjusted_size:.2f}",
-        )
-        
-        signal = TradeSignal(
             market=market,
-            side=ev_result.side,
-            model_prob=model_prob,
-            market_price=market.yes_price,
-            ev_result=ev_result,
-            kelly_size=adjusted_size,
-            passes_gate=gate_result.passed,
-            rejection_reason=gate_result.rejection_reason.value if gate_result.rejection_reason else "",
+            spot_price=spot_price,
+            order_book=book,
+            open_exposure=self.portfolio.total_exposure_usd,
+            daily_pnl=self.portfolio.daily_pnl,
         )
         
-        if gate_result.passed:
-            self.metrics.signals_passed_gate += 1
-        
-        return signal
-    
-    async def execute_signal(self, signal: TradeSignal) -> bool:
-        """
-        Execute a trade signal.
+        # 3. Scan All Strategies
+        all_orders = []
+        for strategy in self.strategies:
+            try:
+                # Check strategy-specific caps?
+                # Grok: "25% exposure each" - logic can be inside strategy or here.
+                # keeping it simple: scan returns desired orders
+                
+                orders = await strategy.scan(context)
+                if orders:
+                    # Enrich with strategy name for tracking
+                    for o in orders:
+                        o['strategy'] = strategy.name
+                    all_orders.extend(orders)
+            except Exception as e:
+                logger.error("Strategy scan failed", strategy=strategy.name, error=str(e))
 
-        Orchestrates:
-        1. Pre-trade checks (circuit breaker, actionability, sniper risk)
-        2. Pricing (order book vs fallback)
-        3. Order creation & submission
-        4. State tracking
+        # 4. Execute (with Risk check)
+        for order_params in all_orders:
+            await self.execute_order_params(order_params, market)
 
-        Args:
-            signal: Signal to execute
-
-        Returns:
-            True if order placed successfully
-        """
-        if not signal.is_actionable:
-            return False
-
-        # Global exposure cap (safety): do not exceed configured fraction of bankroll.
-        max_total = getattr(self.config.trading, "max_total_exposure_pct", 1.0) * self.kelly_sizer.bankroll
-        effective = self._effective_exposure_usd()
-        if signal.kelly_size is not None and effective + signal.kelly_size > max_total:
-            logger.info(
-                "Skipping trade - max total exposure reached",
-                asset=signal.market.asset,
-                current_exposure=effective,
-                attempted_add=signal.kelly_size,
-                max_total=max_total,
-            )
-            return False
-
-        # FIX: Enforce 1 bet per market limit
-        if signal.market.question in self._traded_markets:
-            logger.info("Skipping trade - already traded this market", asset=signal.market.asset)
-            return False
-
+    async def execute_order_params(self, params: dict, market: Market):
+        """Create and submit order from simplified params."""
+        # Check global limits
         if not self.circuit_breaker.can_enter_new_position():
-            logger.info("Circuit breaker blocking new positions")
-            return False
+            return
 
-        # RESEARCH FIX: Check sniper risk before placing orders
-        if not await self._check_sniper_risk_for_market(signal.market):
-            logger.warning(
-                "Skipping trade due to sniper risk",
-                asset=signal.market.asset,
-            )
-            return False
+        # Sizing
+        # Grok: "$5 max bet"
+        # Strategy might return 'size', or we cap it here.
+        recommended_size = params.get('size', 5.0)
+        final_size = min(recommended_size, 5.0) # Hard cap $5
         
-        # Determine token and side
-        token_id = signal.market.yes_token_id if signal.side == TradeSide.BUY_YES else signal.market.no_token_id
-        order_side = OrderSide.BUY
+        # Exposure check
+        if self.portfolio.total_exposure_usd + final_size > 20.0: # Hard cap $20
+            return
 
-        # Get execution price
-        price = await self._get_execution_price(token_id, signal.side, signal.market)
+        # Create Order
+        token_id = params.get('token_id', market.yes_token_id) # Default to YES if not spec
+        side_str = params.get('side', 'BUY')
+        price = params.get('price')
         
-        # Enforce minimum order size
-        min_size = float(getattr(self.config.trading, "min_order_size_usd", 0.0))
-        if signal.kelly_size is None:
-            logger.info("Skipping trade - kelly_size is None")
-            return False
-        if min_size > 0 and signal.kelly_size < min_size:
-            logger.info("Skipping trade - below minimum order size", size=signal.kelly_size, min_size=min_size)
-            return False
+        if not price: return
 
-        # Create order
-        order_type = await self._select_order_type(token_id)
+        side = OrderSide.BUY if side_str == 'BUY' else OrderSide.SELL
+        order_type_str = params.get('order_type', 'GTC')
+        order_type = OrderType.GTC
+        # Map Maker Types if needed
+        
         order = self.order_manager.create_order(
             token_id=token_id,
-            side=order_side,
+            side=side,
             price=price,
-            size=signal.kelly_size,
+            size=final_size,
             order_type=order_type,
-            strategy_id="value_betting",
+            strategy_id=params.get('strategy', 'ensemble'),
         )
         
-        # Submit
         success = await self.order_manager.submit_order(order)
-        
         if success:
             self.metrics.orders_placed += 1
-            self._track_order_metadata(order, signal, price, token_id)
-            
-            # Record that we traded this market
-            self._traded_markets[signal.market.question] = signal.market.end_date.timestamp()
-            
             logger.info(
-                "Order placed (awaiting fill)",
-                client_order_id=order.client_order_id,
-                asset=signal.market.asset,
-                side=signal.side.value,
+                "Ensemble Order Placed",
+                strategy=params.get('strategy'),
+                asset=market.asset,
                 price=price,
-                size=signal.kelly_size,
-                model_prob=signal.model_prob,
-                net_ev=signal.ev_result.net_ev,
+                size=final_size
             )
-        
-        return success
+
+    async def _get_cached_order_book(self, token_id: str) -> "OrderBook":
+        """Get order book with short caching."""
+        # Simple cache wrapper
+        if not self.clob_client:
+            raise ValueError("No CLOB client")
+            
+        now = time.time()
+        # Invalidate cache if older than 1s (Grok: "Poll every 1-3s")
+        if token_id in self._order_book_cache:
+            # Check age? For now, fetch fresh if called in new cycle
+            pass 
+            
+        # For simplicity, always fetch in this step since we cycle markets sequentially
+        # and process_market calls this once.
+        book = await self.clob_client.get_order_book(token_id)
+        self._order_book_cache[token_id] = book
+        return book
+
+    def stop(self):
+        self._running = False
+        logger.info("Ensemble Strategy stopping...")
+
+    # ... (Keep existing helper methods like _cleanup_traded_markets, _handle_sniper_alert)
+
 
     def _cleanup_traded_markets(self) -> None:
         """Remove expired markets from the traded set to free memory."""
@@ -970,6 +822,8 @@ class ValueBettingStrategy:
             raise RuntimeError("CLOB client not initialized")
             
         book = await self.clob_client.get_order_book(token_id)
+        if book is None:
+            raise ValueError(f"CLOB returned None for order book {token_id}")
         self._order_book_cache[token_id] = book
         return book
 
@@ -1430,8 +1284,8 @@ class ValueBettingStrategy:
                 
                 try:
                     await self.run_iteration()
-                except Exception as e:
-                    logger.error("Iteration error", error=str(e))
+                except Exception:
+                    logger.exception("Iteration error")
                 
                 if max_iterations and iteration >= max_iterations:
                     break
