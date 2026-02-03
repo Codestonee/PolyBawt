@@ -2,8 +2,9 @@
 Oracle price feed adapters.
 
 Provides real-time crypto price data from:
-- Binance (primary)
-- Coinbase (fallback)
+- Binance WebSocket (primary, lowest latency)
+- Binance REST (fallback)
+- Coinbase (secondary fallback)
 - Chainlink Data Streams (settlement source - for sniper protection)
 
 CRITICAL: Polymarket settles based on Chainlink oracle prices, NOT Binance.
@@ -17,13 +18,20 @@ a threshold, the bot should immediately cancel orders to pull liquidity."
 """
 
 import asyncio
+import json
 import os
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Coroutine
+from typing import Any, Callable, Coroutine, Optional
 
 import aiohttp
+
+try:
+    import websockets
+    WEBSOCKETS_AVAILABLE = True
+except ImportError:
+    WEBSOCKETS_AVAILABLE = False
 
 from src.infrastructure.logging import get_logger
 
@@ -94,8 +102,9 @@ class OracleFeed:
     Multi-source price oracle with Chainlink sniper protection.
 
     Price Sources (for trading signals):
-    1. Binance (lowest latency, highest volume)
-    2. Coinbase (reliable fallback)
+    1. Binance WebSocket (lowest latency, real-time)
+    2. Binance REST (fallback)
+    3. Coinbase (secondary fallback)
 
     Settlement Source (for sniper protection):
     - Chainlink Data Streams (what Polymarket actually settles on)
@@ -106,6 +115,7 @@ class OracleFeed:
 
     Usage:
         oracle = OracleFeed()
+        await oracle.start_websocket()  # Start real-time feed
         btc_price = await oracle.get_price("BTC")
 
         # Check for sniper risk before placing orders
@@ -121,6 +131,9 @@ class OracleFeed:
         "SOL": "SOLUSDT",
         "XRP": "XRPUSDT",
     }
+
+    # Reverse mapping for WebSocket
+    BINANCE_PAIR_TO_ASSET = {v.lower(): k for k, v in BINANCE_PAIRS.items()}
 
     # Coinbase trading pairs
     COINBASE_PAIRS = {
@@ -140,6 +153,9 @@ class OracleFeed:
         "XRP": "0x0003a8fd2ea9d6ba2d48ed496cbe9e0fd7a5e0a8f2d8c1c5e22d0a0f55c2c8d1",  # XRP/USD (placeholder)
     }
 
+    # Binance WebSocket URL
+    BINANCE_WS_URL = "wss://stream.binance.com:9443/stream"
+
     # Sniper risk thresholds (percentage divergence)
     SNIPER_THRESHOLD_ELEVATED = 0.001  # 0.1% - elevated risk
     SNIPER_THRESHOLD_CRITICAL = 0.003  # 0.3% - critical, cancel orders
@@ -151,9 +167,11 @@ class OracleFeed:
         chainlink_client_id: str | None = None,
         chainlink_client_secret: str | None = None,
         sniper_callback: Callable[[SniperAlert], Coroutine[Any, Any, None]] | None = None,
+        use_websocket: bool = True,
     ):
         self.timeout = aiohttp.ClientTimeout(total=timeout_seconds)
         self.stale_threshold = stale_threshold_seconds
+        self.use_websocket = use_websocket and WEBSOCKETS_AVAILABLE
 
         # Chainlink credentials (from environment if not provided)
         self._chainlink_client_id = chainlink_client_id or os.getenv("CHAINLINK_CLIENT_ID")
@@ -166,6 +184,13 @@ class OracleFeed:
         self._cache: dict[str, PriceTick] = {}
         self._chainlink_cache: dict[str, PriceTick] = {}
         self._health = OracleHealth()
+
+        # WebSocket state
+        self._ws: Optional[Any] = None  # websockets.WebSocketClientProtocol
+        self._ws_task: Optional[asyncio.Task] = None
+        self._ws_running = False
+        self._ws_reconnect_delay = 0.1  # Start at 100ms
+        self._ws_max_reconnect_delay = 30.0  # Max 30s
     
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create HTTP session."""
@@ -174,7 +199,11 @@ class OracleFeed:
         return self._session
     
     async def close(self) -> None:
-        """Close HTTP session."""
+        """Close HTTP session and WebSocket connection."""
+        # Stop WebSocket first
+        await self.stop_websocket()
+
+        # Close HTTP session
         if self._session and not self._session.closed:
             await self._session.close()
     
@@ -492,6 +521,149 @@ class OracleFeed:
     ) -> None:
         """Register callback for sniper risk alerts."""
         self._sniper_callback = callback
+
+    # =========================================================================
+    # WebSocket Methods for Real-Time Price Feeds
+    # =========================================================================
+
+    async def start_websocket(self) -> bool:
+        """
+        Start the WebSocket connection for real-time price updates.
+
+        Returns:
+            True if WebSocket started successfully, False otherwise
+        """
+        if not self.use_websocket:
+            logger.info("WebSocket disabled, using REST polling")
+            return False
+
+        if not WEBSOCKETS_AVAILABLE:
+            logger.warning("websockets library not installed, using REST polling")
+            return False
+
+        if self._ws_running:
+            logger.debug("WebSocket already running")
+            return True
+
+        self._ws_running = True
+        self._ws_task = asyncio.create_task(self._ws_connection_loop())
+        logger.info("WebSocket price feed started")
+        return True
+
+    async def stop_websocket(self) -> None:
+        """Stop the WebSocket connection."""
+        self._ws_running = False
+
+        if self._ws:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+
+        if self._ws_task:
+            self._ws_task.cancel()
+            try:
+                await self._ws_task
+            except asyncio.CancelledError:
+                pass
+            self._ws_task = None
+
+        logger.info("WebSocket price feed stopped")
+
+    async def _ws_connection_loop(self) -> None:
+        """Main WebSocket connection loop with automatic reconnection."""
+        while self._ws_running:
+            try:
+                await self._ws_connect_and_listen()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning(
+                    "WebSocket connection error",
+                    error=str(e),
+                    reconnect_delay=self._ws_reconnect_delay,
+                )
+
+            if self._ws_running:
+                # Exponential backoff with jitter
+                jitter = self._ws_reconnect_delay * 0.2 * (0.5 - asyncio.get_event_loop().time() % 1)
+                await asyncio.sleep(self._ws_reconnect_delay + jitter)
+                self._ws_reconnect_delay = min(
+                    self._ws_reconnect_delay * 2,
+                    self._ws_max_reconnect_delay
+                )
+
+    async def _ws_connect_and_listen(self) -> None:
+        """Connect to Binance WebSocket and process messages."""
+        import websockets
+
+        # Build subscription streams for all assets
+        streams = [f"{pair.lower()}@aggTrade" for pair in self.BINANCE_PAIRS.values()]
+        stream_param = "/".join(streams)
+        ws_url = f"{self.BINANCE_WS_URL}?streams={stream_param}"
+
+        logger.info("Connecting to Binance WebSocket", url=ws_url)
+
+        async with websockets.connect(ws_url, ping_interval=20, ping_timeout=10) as ws:
+            self._ws = ws
+            self._ws_reconnect_delay = 0.1  # Reset on successful connection
+            self._health.binance_healthy = True
+            logger.info("WebSocket connected successfully")
+
+            async for message in ws:
+                if not self._ws_running:
+                    break
+
+                try:
+                    await self._process_ws_message(message)
+                except Exception as e:
+                    logger.warning("Error processing WebSocket message", error=str(e))
+
+    async def _process_ws_message(self, message: str) -> None:
+        """Process a single WebSocket message."""
+        data = json.loads(message)
+
+        # Binance combined stream format: {"stream": "btcusdt@aggTrade", "data": {...}}
+        if "data" in data:
+            trade_data = data["data"]
+            stream = data.get("stream", "")
+        else:
+            trade_data = data
+            stream = ""
+
+        # Extract symbol from stream name or data
+        symbol = trade_data.get("s", "").lower()
+        if not symbol and "@" in stream:
+            symbol = stream.split("@")[0]
+
+        asset = self.BINANCE_PAIR_TO_ASSET.get(symbol)
+        if not asset:
+            return
+
+        # Extract price from aggTrade message
+        price = float(trade_data.get("p", 0))
+        timestamp = trade_data.get("T", time.time() * 1000) / 1000  # Convert ms to seconds
+
+        if price > 0:
+            self._cache[asset] = PriceTick(
+                asset=asset,
+                price=price,
+                timestamp=timestamp,
+                source="binance_ws"
+            )
+
+            logger.debug(
+                "WebSocket price update",
+                asset=asset,
+                price=price,
+                latency_ms=(time.time() - timestamp) * 1000,
+            )
+
+    @property
+    def is_websocket_connected(self) -> bool:
+        """Check if WebSocket is currently connected."""
+        return self._ws is not None and self._ws_running
 
 
 async def create_oracle_feed(

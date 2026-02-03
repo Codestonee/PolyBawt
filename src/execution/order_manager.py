@@ -270,7 +270,22 @@ class OrderManager:
         self._total_filled = 0
         self._total_canceled = 0
         self._total_rejected = 0
-    
+        
+        # Observers for state changes
+        self._listeners: list[Callable[[Order], None]] = []
+
+    def add_listener(self, callback: Callable[[Order], None]) -> None:
+        """Register a callback for order updates."""
+        self._listeners.append(callback)
+
+    def _notify_listeners(self, order: Order) -> None:
+        """Notify all listeners of order update."""
+        for listener in self._listeners:
+            try:
+                listener(order)
+            except Exception as e:
+                logger.error("Listener failed", error=str(e))
+
     def create_order(
         self,
         token_id: str,
@@ -401,6 +416,7 @@ class OrderManager:
             if self._persistence:
                 self._persistence.save_order(order)
 
+            self._notify_listeners(order)
             return True
         
         # Real submission via callback
@@ -429,6 +445,8 @@ class OrderManager:
                 # Persist post-submit state (NEW/REJECTED/FAILED/etc.)
                 if self._persistence:
                     self._persistence.save_order(order)
+                
+                self._notify_listeners(order)
 
                 if order.state.is_terminal and order.state not in (OrderState.FILLED, OrderState.CANCELED):
                     if order.state == OrderState.REJECTED:
@@ -506,6 +524,8 @@ class OrderManager:
                 # FIX #8: Persist updated state after cancel
                 if self._persistence:
                     self._persistence.save_order(order)
+                
+                self._notify_listeners(order)
                     
                 return True
             except Exception as e:
@@ -574,12 +594,12 @@ class OrderManager:
     ) -> bool:
         """
         Handle fill event from exchange.
-        
+
         Args:
             client_order_id: Order that was filled
             fill_size: Size filled in this event
             fill_price: Price of this fill
-        
+
         Returns:
             True if fill was applied
         """
@@ -587,9 +607,9 @@ class OrderManager:
         if order is None:
             logger.warning("Fill for unknown order", client_order_id=client_order_id)
             return False
-        
+
         order.add_fill(fill_size, fill_price)
-        
+
         logger.info(
             "Order filled",
             client_order_id=client_order_id,
@@ -598,14 +618,17 @@ class OrderManager:
             filled_pct=f"{order.fill_pct:.0%}",
             state=order.state.value,
         )
-        
+
+        # Update filled counter
         if order.state == OrderState.FILLED:
             self._total_filled += 1
-        
-        # FIX #8: Persist updated state after fill
+
+        # Persist updated state after fill
         if self._persistence:
             self._persistence.save_order(order)
-            
+
+        self._notify_listeners(order)
+
         return True
     
     def handle_rejection(

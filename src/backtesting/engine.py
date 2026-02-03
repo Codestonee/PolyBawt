@@ -11,7 +11,7 @@ Usage:
     engine = BacktestEngine(initial_capital=1000)
     engine.load_historical_data("btc_15m_2024.csv")
 
-    strategy = ValueBettingStrategy(...)
+    strategy = EnsembleStrategy(...)
     results = await engine.run(strategy)
 
     print(results.sharpe_ratio)

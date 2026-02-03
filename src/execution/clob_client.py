@@ -210,83 +210,111 @@ class CLOBClient:
                 error_message="CLOB client not initialized",
             )
 
-        try:
-            # Build order using py-clob-client
-            from py_clob_client.order_builder.constants import BUY, SELL
-            from py_clob_client.clob_types import OrderArgs
+        # Retry logic for 500 Internal Server Errors
+        max_retries = 3
+        retry_delay = 0.5
 
-            order_side = BUY if side == "BUY" else SELL
-
-            # Create OrderArgs with correct API
-            order_args = OrderArgs(
-                token_id=token_id,
-                price=price,
-                size=size_shares,  # CRITICAL: Use shares, not USD
-                side=order_side,
-            )
-            
-            # Create and sign order
-            order = self._clob_client.create_order(order_args)
-            
-            # Submit order
-            # Map order type to py-clob-client enum.
-            from py_clob_client.clob_types import OrderType as PMOrderType
-            ot = str(order_type).upper() if order_type else "GTC"
-            # Our internal OrderType supports IOC/FAK naming; Polymarket uses FAK.
-            if ot == "IOC":
-                ot = "FAK"
+        for attempt in range(max_retries):
             try:
-                pm_order_type = getattr(PMOrderType, ot)
-            except Exception:
-                pm_order_type = PMOrderType.GTC
+                # Build order using py-clob-client
+                from py_clob_client.order_builder.constants import BUY, SELL
+                from py_clob_client.clob_types import OrderArgs
 
-            response = await asyncio.to_thread(
-                self._clob_client.post_order, order, pm_order_type
-            )
-            
-            if response and response.get("orderID"):
-                logger.info(
-                    "Order placed",
-                    order_id=response["orderID"],
+                order_side = BUY if side == "BUY" else SELL
+
+                # Create OrderArgs with correct API
+                order_args = OrderArgs(
                     token_id=token_id,
-                    side=side,
                     price=price,
+                    size=size_shares,  # CRITICAL: Use shares, not USD
+                    side=order_side,
+                )
+                
+                # Create and sign order
+                order = self._clob_client.create_order(order_args)
+                
+                # Submit order
+                # Map order type to py-clob-client enum.
+                from py_clob_client.clob_types import OrderType as PMOrderType
+                ot = str(order_type).upper() if order_type else "GTC"
+                # Our internal OrderType supports IOC/FAK naming; Polymarket uses FAK.
+                if ot == "IOC":
+                    ot = "FAK"
+                try:
+                    pm_order_type = getattr(PMOrderType, ot)
+                except Exception:
+                    pm_order_type = PMOrderType.GTC
+
+                response = await asyncio.to_thread(
+                    self._clob_client.post_order, order, pm_order_type
+                )
+                
+                if response and response.get("orderID"):
+                    logger.info(
+                        "Order placed",
+                        order_id=response["orderID"],
+                        token_id=token_id,
+                        side=side,
+                        price=price,
+                        size_usd=size_usd,
+                        size_shares=size_shares,
+                    )
+                    return OrderResponse(
+                        success=True,
+                        exchange_order_id=response["orderID"],
+                        timestamp=time.time(),
+                    )
+                else:
+                    # FIX #7: Parse actual error details
+                    error_msg = str(response)
+                    error_code = "UNKNOWN"
+                    
+                    if isinstance(response, dict):
+                        error_msg = response.get("error") or response.get("errorMsg") or str(response)
+                        if response.get("code"):
+                            error_code = str(response.get("code"))
+                    
+                    # Check for 500s in the response body
+                    if "Internal server error" in str(error_msg) or "500" in str(error_code):
+                        if attempt < max_retries - 1:
+                            logger.warning(f"CLOB 500 Error, retrying {attempt+1}/{max_retries}...", error=error_msg)
+                            await asyncio.sleep(retry_delay * (2 ** attempt))
+                            continue
+
+                    return OrderResponse(
+                        success=False,
+                        error_code=error_code,
+                        error_message=error_msg,
+                    )
+
+            except Exception as e:
+                # Catch-all for exceptions
+                error_str = str(e)
+                # Check for 500s in exception message
+                if "Internal server error" in error_str or "500" in error_str:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"CLOB Exception 500, retrying {attempt+1}/{max_retries}...", error=error_str)
+                        await asyncio.sleep(retry_delay * (2 ** attempt))
+                        continue
+                
+                logger.error(
+                    "Order placement failed",
+                    error=error_str,
                     size_usd=size_usd,
                     size_shares=size_shares,
                 )
                 return OrderResponse(
-                    success=True,
-                    exchange_order_id=response["orderID"],
-                    timestamp=time.time(),
-                )
-            else:
-                # FIX #7: Parse actual error details
-                error_msg = str(response)
-                error_code = "UNKNOWN"
-                
-                if isinstance(response, dict):
-                    error_msg = response.get("error") or response.get("errorMsg") or str(response)
-                    if response.get("code"):
-                        error_code = str(response.get("code"))
-                
-                return OrderResponse(
                     success=False,
-                    error_code=error_code,
-                    error_message=error_msg,
+                    error_code="EXCEPTION",
+                    error_message=error_str,
                 )
-
-        except Exception as e:
-            logger.error(
-                "Order placement failed",
-                error=str(e),
-                size_usd=size_usd,
-                size_shares=size_shares,
-            )
-            return OrderResponse(
-                success=False,
-                error_code="EXCEPTION",
-                error_message=str(e),
-            )
+        
+        # If we get here, we exhausted retries
+        return OrderResponse(
+            success=False,
+            error_code="MAX_RETRIES",
+            error_message="Exhausted retries on 500 error",
+        )
     
     async def cancel_order(
         self,
@@ -316,55 +344,87 @@ class CLOBClient:
                 error_message="CLOB client not initialized",
             )
         
-        try:
-            response = await asyncio.to_thread(
-                self._clob_client.cancel, exchange_order_id
-            )
-            
-            # FIX: Verify cancel response instead of assuming success
-            # The API may return an error object or indicate failure
-            if response is None:
-                logger.warning(
-                    "Cancel returned None response",
+        # Retry logic for 500 errors
+        max_retries = 3
+        retry_delay = 0.5
+
+        for attempt in range(max_retries):
+            try:
+                response = await asyncio.to_thread(
+                    self._clob_client.cancel, exchange_order_id
+                )
+                
+                # FIX: Verify cancel response instead of assuming success
+                # The API may return an error object or indicate failure
+                if response is None:
+                    # In some cases, None might actually mean void success, but usually it's a failure
+                    # We will treat it as potential 500 if repeated
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Cancel returned None, retrying {attempt+1}/{max_retries}...", exchange_order_id=exchange_order_id)
+                        await asyncio.sleep(retry_delay * (2 ** attempt))
+                        continue
+
+                    logger.warning(
+                        "Cancel returned None response",
+                        exchange_order_id=exchange_order_id,
+                    )
+                    return CancelResponse(
+                        success=False,
+                        error_message="Cancel returned None response",
+                    )
+                
+                # Check for error fields in response
+                if isinstance(response, dict):
+                    if response.get("error") or response.get("errorMsg"):
+                        error_msg = response.get("error") or response.get("errorMsg") or "Unknown cancel error"
+                        
+                        # Retry on 500
+                        if "Internal server error" in str(error_msg) or "500" in str(error_msg):
+                            if attempt < max_retries - 1:
+                                logger.warning(f"Cancel 500 Error, retrying {attempt+1}/{max_retries}...", error=error_msg)
+                                await asyncio.sleep(retry_delay * (2 ** attempt))
+                                continue
+
+                        logger.error(
+                            "Cancel API returned error",
+                            exchange_order_id=exchange_order_id,
+                            error=error_msg,
+                        )
+                        return CancelResponse(
+                            success=False,
+                            error_message=str(error_msg),
+                        )
+                    # Check for success indicators
+                    if response.get("canceled") == False or response.get("success") == False:
+                        return CancelResponse(
+                            success=False,
+                            error_message=f"Cancel rejected: {response}",
+                        )
+                
+                logger.info(
+                    "Order cancelled successfully",
                     exchange_order_id=exchange_order_id,
                 )
+                return CancelResponse(success=True)
+                
+            except Exception as e:
+                # Catch 500s in exception
+                if "Internal server error" in str(e) or "500" in str(e):
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Cancel Exception 500, retrying {attempt+1}/{max_retries}...", error=str(e))
+                        await asyncio.sleep(retry_delay * (2 ** attempt))
+                        continue
+                
+                logger.error("Order cancel failed", error=str(e))
                 return CancelResponse(
                     success=False,
-                    error_message="Cancel returned None response",
+                    error_message=str(e),
                 )
-            
-            # Check for error fields in response
-            if isinstance(response, dict):
-                if response.get("error") or response.get("errorMsg"):
-                    error_msg = response.get("error") or response.get("errorMsg") or "Unknown cancel error"
-                    logger.error(
-                        "Cancel API returned error",
-                        exchange_order_id=exchange_order_id,
-                        error=error_msg,
-                    )
-                    return CancelResponse(
-                        success=False,
-                        error_message=str(error_msg),
-                    )
-                # Check for success indicators
-                if response.get("canceled") == False or response.get("success") == False:
-                    return CancelResponse(
-                        success=False,
-                        error_message=f"Cancel rejected: {response}",
-                    )
-            
-            logger.info(
-                "Order cancelled successfully",
-                exchange_order_id=exchange_order_id,
-            )
-            return CancelResponse(success=True)
-            
-        except Exception as e:
-            logger.error("Order cancel failed", error=str(e))
-            return CancelResponse(
-                success=False,
-                error_message=str(e),
-            )
+        
+        return CancelResponse(
+            success=False,
+            error_message="Exhausted retries on 500 error",
+        )
     
     async def cancel_all_orders(self) -> int:
         """
@@ -572,36 +632,8 @@ class CLOBClient:
         Returns:
             Balance in USDC (float)
         """
-        await self.rate_limiter.acquire_query()
-        
-        if not self._initialized or not self._clob_client:
-            return 0.0
-            
-        try:
-            # Check for auth
-            if not hasattr(self._clob_client, 'key') or not self._clob_client.key:
-                return 0.0
-
-            # Get collateral balance
-            # py-clob-client exposes get_balance_allowance (or similar)
-            # We assume standard collateral fetch
-            # Note: py-clob-client implementation varies, but get_balance_allowance is common
-            balance_info = await asyncio.to_thread(
-                self._clob_client.get_balance_allowance,
-                params={"asset_type": "COLLATERAL"}
-            )
-            
-            # Parse balance
-            # Response format: {'balance': '1000000', ...} (usually 6 decimals for USDC)
-            if balance_info and isinstance(balance_info, dict):
-                raw_balance = balance_info.get("balance", "0")
-                return float(raw_balance) / 1_000_000  # USDC has 6 decimals
-                
-            return 0.0
-            
-        except Exception as e:
-            logger.error("Get account balance failed", error=str(e))
-            return 0.0
+        res = await self.get_collateral_balance_usdc()
+        return res if res is not None else 0.0
 
 
 async def create_clob_client(

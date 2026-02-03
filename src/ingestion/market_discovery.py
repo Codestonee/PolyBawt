@@ -164,6 +164,10 @@ class MarketDiscovery:
             logger.error("Gamma API error", error=str(e))
             return []
     
+    async def get_active_markets(self, assets: list[str] | None = None) -> list[Market]:
+        """Alias for get_crypto_15m_markets."""
+        return await self.get_crypto_15m_markets(assets=assets)
+
     async def get_crypto_15m_markets(
         self,
         assets: list[str] | None = None,

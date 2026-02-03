@@ -13,9 +13,10 @@ class TradeContext:
     """Context passed to strategies during scan."""
     market: Market
     spot_price: float
-    order_book: Any  # OrderBook object
-    open_exposure: float
-    daily_pnl: float
+    order_book: Any  # OrderBook object for YES token
+    order_book_no: Any = None  # OrderBook object for NO token (for arbitrage)
+    open_exposure: float = 0.0
+    daily_pnl: float = 0.0
 
 class BaseStrategy(ABC):
     """

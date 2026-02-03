@@ -1,46 +1,39 @@
-# Polymarket 15m Trading Bot
+# Grok-Native Polymarket Bot
 
-Production-grade algorithmic trading bot for Polymarket's 15-minute BTC/ETH/SOL/XRP prediction markets.
+Ultra-lean, high-frequency bot for Polymarket 15-minute markets. Rewritten for the "Grok Strategy Ensemble."
 
 ## Quick Start
 
-```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Configure
-cp config/example.yaml config/local.yaml
-# Edit config/local.yaml with your settings
-
-# Set environment variables
-export POLYMARKET_PRIVATE_KEY="your_key"
-export POLYMARKET_FUNDER_ADDRESS="your_address"
-
-# Run paper trading
+```powershell
+# 1. Start Paper Trading (Dry Run)
 python -m src.main --config config/paper.yaml
 
-# Run live (requires --live flag for safety)
-python -m src.main --config config/production.yaml --live
+# 2. Start Live Trading ($5 per bet, $20 cap)
+python -m src.main --config config/live.yaml --live
 ```
+
+## Strategy Ensemble (The "Grok-4")
+
+1. **Arb Taker**: Snipes risk-free profit when YES + NO < 0.98.
+2. **Latency Snipe**: Offensive trades on spot price moves > 2%.
+3. **Spread Maker**: Passive market making on spreads > 5c.
+4. **Legged Hedge**: Buys crashes (> 15% drop) and hedges opposite leg.
 
 ## Project Structure
 
-```
+```text
 src/
-├── ingestion/      # WebSocket, Oracle feeds, Market discovery
-├── models/         # Pricing models (Jump-Diffusion, BSM)
-├── strategy/       # Trading strategies
-├── execution/      # Order management, Rate limiting
-├── risk/           # Kelly sizing, Circuit breakers
-├── portfolio/      # PnL tracking
-└── infrastructure/ # Config, Logging, Metrics
+├── strategy/       # Grok Ensemble & Strategy implementation
+├── ingestion/      # Oracle feeds & Market discovery
+├── execution/      # Order management & CLOB interaction
+├── risk/           # Portfolio safety & Circuit breakers
+└── infrastructure/ # Core logging and configuration
 ```
 
 ## Configuration
 
-- `config/local.yaml` - Local development (mock exchange)
-- `config/paper.yaml` - Paper trading (real data, no orders)
-- `config/production.yaml` - Live trading
+- `config/paper.yaml` - Real-time analysis, no capital risk.
+- `config/live.yaml` - Live execution with $20 exposure cap.
 
 ## Safety Features
 
