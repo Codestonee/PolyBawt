@@ -1,9 +1,11 @@
 from contextlib import asynccontextmanager
 from typing import List
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import traceback
 
 from src.api.state import get_state
 from src.infrastructure.logging import get_logger
@@ -83,6 +85,30 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Catch-all for unhandled exceptions (500 errors)."""
+    error_detail = traceback.format_exc()
+    logger.error(
+        "Unhandled API Exception",
+        path=request.url.path,
+        error=str(exc),
+        traceback=error_detail
+    )
+    return JSONResponse(
+        status_code=500,
+        content={
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": "Internal server error (Local API)",
+                "detail": str(exc) if not get_state().is_live else "See logs for details"
+            },
+            "status": "fail"
+        }
+    )
 
 
 @app.get("/")
