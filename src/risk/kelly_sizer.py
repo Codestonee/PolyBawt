@@ -367,8 +367,8 @@ class KellySizer:
             loss_mult = self._calculate_loss_streak_multiplier()
             unc_mult *= loss_mult
 
-        # Apply adaptive adjustments
-        total_adaptive_mult = vol_mult * dd_mult * unc_mult
+        # Apply adaptive adjustments with floor to prevent near-zero sizing
+        total_adaptive_mult = max(0.25, vol_mult * dd_mult * unc_mult)
         recommended *= total_adaptive_mult
 
         # Log significant reductions
@@ -427,15 +427,16 @@ class KellySizer:
     def kelly_for_edge(self, edge: float, price: float = 0.5) -> float:
         """
         Quick calculation of Kelly fraction for given edge at a price.
-        
+
         Useful for threshold checks.
         """
         if edge <= 0:
             return 0
-        
+
+        price = max(0.01, min(0.99, price))
         p = price + edge  # Win probability = market + edge
         p = max(0.01, min(0.99, p))
-        
+
         b = (1 - price) / price
         kelly = (p * (b + 1) - 1) / b
         
@@ -486,7 +487,7 @@ class CorrelationMatrix:
         """Get correlation between two assets (1.0 if same asset)."""
         if asset1 == asset2:
             return 1.0
-        return self._correlations.get(self._key(asset1, asset2), 0.5)
+        return self._correlations.get(self._key(asset1, asset2), 0.85)
     
     def max_correlation_with(
         self,

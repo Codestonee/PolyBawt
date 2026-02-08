@@ -272,6 +272,96 @@ class MarketDiscovery:
         )
         
         return markets
+
+    async def get_market_resolution(
+        self,
+        token_id: str | None = None,
+        condition_id: str | None = None,
+        lookback_limit: int = 500,
+    ) -> bool | None:
+        """
+        Query Gamma for a resolved market outcome.
+
+        Returns:
+            True if YES won, False if NO won, None if unresolved/unknown.
+        """
+        if not token_id and not condition_id:
+            return None
+
+        markets = await self.get_markets(active=False, closed=True, limit=lookback_limit)
+        for raw in markets:
+            if condition_id and raw.get("conditionId") != condition_id:
+                continue
+            if token_id and not self._market_contains_token(raw, token_id):
+                continue
+            resolved = self._extract_yes_resolution(raw)
+            if resolved is not None:
+                return resolved
+        return None
+
+    def _market_contains_token(self, raw: dict[str, Any], token_id: str) -> bool:
+        clob_token_ids = raw.get("clobTokenIds")
+        if isinstance(clob_token_ids, str):
+            try:
+                clob_token_ids = json.loads(clob_token_ids)
+            except Exception:
+                clob_token_ids = []
+        if not isinstance(clob_token_ids, list):
+            return False
+        return token_id in clob_token_ids
+
+    def _extract_yes_resolution(self, raw: dict[str, Any]) -> bool | None:
+        """
+        Best-effort extraction of YES winner from Gamma market payload.
+
+        Prefers explicit resolved fields; then falls back to terminal outcome prices.
+        """
+        resolved_flag = raw.get("resolved")
+        if resolved_flag is False:
+            return None
+
+        winner = raw.get("winningOutcome") or raw.get("resolution")
+        if isinstance(winner, str):
+            w = winner.strip().lower()
+            if w in ("yes", "true", "1"):
+                return True
+            if w in ("no", "false", "0"):
+                return False
+
+        outcomes = raw.get("outcomes")
+        outcome_prices = raw.get("outcomePrices")
+        if isinstance(outcomes, str):
+            try:
+                outcomes = json.loads(outcomes)
+            except Exception:
+                outcomes = None
+        if isinstance(outcome_prices, str):
+            try:
+                outcome_prices = json.loads(outcome_prices)
+            except Exception:
+                outcome_prices = None
+
+        if (
+            isinstance(outcomes, list)
+            and isinstance(outcome_prices, list)
+            and len(outcomes) >= 2
+            and len(outcome_prices) >= 2
+        ):
+            try:
+                p0 = float(outcome_prices[0])
+                p1 = float(outcome_prices[1])
+                o0 = str(outcomes[0]).strip().lower()
+                o1 = str(outcomes[1]).strip().lower()
+            except (TypeError, ValueError):
+                return None
+
+            # Terminal binary state is typically [1.0, 0.0] or [0.0, 1.0].
+            if p0 >= 0.999 and p1 <= 0.001:
+                return o0 in ("yes", "true", "1")
+            if p1 >= 0.999 and p0 <= 0.001:
+                return o1 in ("yes", "true", "1")
+
+        return None
     
     def _parse_market(self, raw: dict[str, Any]) -> Market | None:
         """Parse raw market data into Market object."""

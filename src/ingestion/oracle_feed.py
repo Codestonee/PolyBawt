@@ -18,8 +18,10 @@ a threshold, the bot should immediately cancel orders to pull liquidity."
 """
 
 import asyncio
+import base64
 import json
 import os
+import random
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -168,6 +170,7 @@ class OracleFeed:
         chainlink_client_secret: str | None = None,
         sniper_callback: Callable[[SniperAlert], Coroutine[Any, Any, None]] | None = None,
         use_websocket: bool = True,
+        require_chainlink_in_live: bool = False,  # Enforce Chainlink in live mode
     ):
         self.timeout = aiohttp.ClientTimeout(total=timeout_seconds)
         self.stale_threshold = stale_threshold_seconds
@@ -176,6 +179,17 @@ class OracleFeed:
         # Chainlink credentials (from environment if not provided)
         self._chainlink_client_id = chainlink_client_id or os.getenv("CHAINLINK_CLIENT_ID")
         self._chainlink_client_secret = chainlink_client_secret or os.getenv("CHAINLINK_CLIENT_SECRET")
+
+        # CRITICAL: Validate Chainlink credentials for live trading
+        # Polymarket settles on Chainlink prices - trading without them is risky
+        if require_chainlink_in_live:
+            if not self._chainlink_client_id or not self._chainlink_client_secret:
+                raise ValueError(
+                    "CHAINLINK_CLIENT_ID and CHAINLINK_CLIENT_SECRET are required for live trading. "
+                    "Polymarket settles on Chainlink prices - trading without them exposes you to sniper risk. "
+                    "Set these environment variables or pass them via the constructor."
+                )
+            logger.info("Chainlink credentials validated for live mode")
 
         # Callback when sniper risk is detected
         self._sniper_callback = sniper_callback
@@ -410,8 +424,11 @@ class OracleFeed:
             # See: https://docs.chain.link/data-streams/reference/streams-direct/streams-direct-onchain-verification
             url = "https://api.chain.link/data-streams/v1/reports/latest"
 
+            # FIX P1 #5: Proper base64 encoding for Basic auth
+            credentials = f"{self._chainlink_client_id}:{self._chainlink_client_secret}"
+            encoded_credentials = base64.b64encode(credentials.encode()).decode()
             headers = {
-                "Authorization": f"Basic {self._chainlink_client_id}:{self._chainlink_client_secret}",
+                "Authorization": f"Basic {encoded_credentials}",
                 "Content-Type": "application/json",
             }
 
@@ -463,6 +480,15 @@ class OracleFeed:
         Returns:
             SniperAlert if risk detected, None if safe
         """
+        # FIX P0 #2: Validate market_mid_price to prevent division by zero
+        if market_mid_price <= 0:
+            logger.warning(
+                "Invalid market_mid_price for sniper check",
+                asset=asset,
+                market_mid_price=market_mid_price,
+            )
+            return None
+
         chainlink_price = await self.get_chainlink_price(asset)
 
         if chainlink_price is None:
@@ -587,7 +613,7 @@ class OracleFeed:
 
             if self._ws_running:
                 # Exponential backoff with jitter
-                jitter = self._ws_reconnect_delay * 0.2 * (0.5 - asyncio.get_event_loop().time() % 1)
+                jitter = self._ws_reconnect_delay * 0.2 * random.uniform(-1, 1)
                 await asyncio.sleep(self._ws_reconnect_delay + jitter)
                 self._ws_reconnect_delay = min(
                     self._ws_reconnect_delay * 2,

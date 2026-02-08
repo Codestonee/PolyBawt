@@ -16,7 +16,9 @@ class TradeContext:
     order_book: Any  # OrderBook object for YES token
     order_book_no: Any = None  # OrderBook object for NO token (for arbitrage)
     open_exposure: float = 0.0
+    token_exposure: dict[str, float] | None = None  # token_id -> open size_usd
     daily_pnl: float = 0.0
+    obi_yes: float = 0.0  # Order book imbalance for YES token (-1 to 1)
 
 class BaseStrategy(ABC):
     """

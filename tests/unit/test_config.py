@@ -41,6 +41,16 @@ class TestTradingConfig:
         config = TradingConfig(min_edge_threshold=0)
         assert config.min_edge_threshold == 0
 
+    def test_positive_safety_fields_validation(self):
+        with pytest.raises(ValueError):
+            TradingConfig(max_position_per_token_usd=0)
+        with pytest.raises(ValueError):
+            TradingConfig(order_book_ttl_seconds=0)
+        with pytest.raises(ValueError):
+            TradingConfig(market_concurrency=0)
+        with pytest.raises(ValueError):
+            TradingConfig(inter_market_jitter_ms_min=-1)
+
 
 class TestRiskConfig:
     """Tests for RiskConfig validation."""

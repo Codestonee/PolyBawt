@@ -1,4 +1,3 @@
-import logging
 import time
 import random
 from typing import List, Dict, Optional, Any, Deque
@@ -10,8 +9,9 @@ from src.strategy.base import BaseStrategy, TradeContext
 from src.strategy.arbitrage_detector import ArbitrageDetector
 from src.execution.clob_client import CLOBClient
 from src.infrastructure.config import AppConfig
+from src.infrastructure.logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # ==============================================================================
 # STRATEGY 1: ARB TAKER (Risk-Free* Profit)
@@ -108,7 +108,7 @@ class ArbTakerStrategy(BaseStrategy):
 
         # ===== SHORT ARBITRAGE: Sell both YES and NO =====
         # If YES_bid + NO_bid > 1.02, we can sell both and guarantee profit
-        # (Only possible if we already hold positions)
+        # (Only possible if we already hold positions on both legs)
         if yes_bid is not None and no_bid is not None:
             total_proceeds = yes_bid + no_bid
 
@@ -123,9 +123,35 @@ class ArbTakerStrategy(BaseStrategy):
                         f"{total_proceeds:.3f}, gross profit {gross_profit:.2%}, "
                         f"net profit {net_profit:.2%}"
                     )
-                    # Note: Short arb requires existing inventory
-                    # For now, just log - implementation would need portfolio check
-                    pass
+                    token_exposure = context.token_exposure or {}
+                    yes_inv = float(token_exposure.get(context.market.yes_token_id, 0.0))
+                    no_inv = float(token_exposure.get(context.market.no_token_id, 0.0))
+
+                    # Can only execute both sell legs up to the smaller inventory.
+                    max_exit_size = min(self.max_arb_size, yes_inv, no_inv)
+                    if max_exit_size >= 1.0:
+                        orders.append({
+                            "side": "SELL",
+                            "token_id": context.market.yes_token_id,
+                            "price": yes_bid,
+                            "size": max_exit_size,
+                            "edge": net_profit,
+                            "reason": f"short_arb_{gross_profit:.2%}",
+                        })
+                        orders.append({
+                            "side": "SELL",
+                            "token_id": context.market.no_token_id,
+                            "price": no_bid,
+                            "size": max_exit_size,
+                            "edge": net_profit,
+                            "reason": f"short_arb_{gross_profit:.2%}",
+                        })
+                    else:
+                        logger.debug(
+                            "Short arb skipped: insufficient dual-leg inventory",
+                            yes_inventory_usd=yes_inv,
+                            no_inventory_usd=no_inv,
+                        )
 
         return orders
 
@@ -251,14 +277,22 @@ class LatencySnipeStrategy(BaseStrategy):
                     f"YES only {yes_delta_pct:.2%}, expected {expected_yes_move:.2%}"
                 )
                 # Buy NO instead of selling YES (safer for binary markets)
-                if context.market.no_token_id and context.market.no_price:
-                    orders.append({
-                        "side": "BUY",
-                        "token_id": context.market.no_token_id,
-                        "price": context.market.no_price,
-                        "size": self.max_position_size,
-                        "reason": f"latency_snipe_dump_{spot_delta_pct:.2%}"
-                    })
+                # FIX P4 #10: Prefer order book price over stale market price
+                if context.market.no_token_id:
+                    no_price = None
+                    if context.order_book_no and context.order_book_no.best_ask:
+                        no_price = context.order_book_no.best_ask
+                    elif context.market.no_price:
+                        no_price = context.market.no_price
+
+                    if no_price:
+                        orders.append({
+                            "side": "BUY",
+                            "token_id": context.market.no_token_id,
+                            "price": no_price,
+                            "size": self.max_position_size,
+                            "reason": f"latency_snipe_dump_{spot_delta_pct:.2%}"
+                        })
 
         return orders
 
@@ -272,24 +306,29 @@ class LatencySnipeStrategy(BaseStrategy):
 # ==============================================================================
 class SpreadMakerStrategy(BaseStrategy):
     """
-    Passive market making strategy.
-
-    Posts bid/ask orders inside the spread when spread > threshold.
-    Implements basic inventory management to avoid directional risk.
+    Passive market making with cancel-before-quote lifecycle management.
 
     Features:
-    - Posts both bid and ask orders
-    - Skews quotes based on inventory
-    - Minimum spread requirement (5 cents)
-    - Size based on available liquidity
+    - Cancel stale orders before posting new quotes
+    - Order refresh rate limiting (15s minimum between requotes)
+    - Active order tracking per token
+    - Inventory skewing
     """
     def __init__(self, config: AppConfig):
         super().__init__("SpreadMaker", config)
         self.min_spread = 0.05  # 5 cents minimum spread
         self.quote_offset = 0.01  # 1 cent inside the market
         self.max_size_per_side = 5.0  # $5 max per side
+        self.order_refresh_time = 15.0  # Don't requote more than every 15s
+
         # Track inventory for skewing
-        self.inventory: Dict[str, float] = {}  # token_id -> net position
+        self.inventory: Dict[str, float] = {}
+        # Track active orders: token_id -> [client_order_ids]
+        self._active_orders: Dict[str, List[str]] = {}
+        # Track last quote time: token_id -> timestamp
+        self._last_quote_time: Dict[str, float] = {}
+        # Order manager reference (set by EnsembleStrategy)
+        self._order_manager: Optional[Any] = None
 
     async def scan(self, context: TradeContext) -> List[dict]:
         book = context.order_book
@@ -298,46 +337,54 @@ class SpreadMakerStrategy(BaseStrategy):
 
         spread = book.best_ask - book.best_bid
         if spread < self.min_spread:
-            return []  # Spread too tight, no edge
+            return []
+
+        token_id = context.market.yes_token_id
+        now = time.time()
+
+        # Rate limit requoting
+        last_quote = self._last_quote_time.get(token_id, 0.0)
+        if now - last_quote < self.order_refresh_time:
+            return []
+
+        # Cancel stale orders before posting new ones
+        if self._order_manager and token_id in self._active_orders:
+            stale_ids = self._active_orders[token_id]
+            for oid in stale_ids:
+                order = self._order_manager.get_order(oid)
+                if order and order.state.is_active:
+                    try:
+                        await self._order_manager.cancel_order(order)
+                    except Exception as e:
+                        logger.warning(f"SpreadMaker cancel failed: {e}")
+            self._active_orders[token_id] = []
 
         mid = (book.best_ask + book.best_bid) / 2
-
-        # Get current inventory for this token
-        token_id = context.market.yes_token_id
         current_inventory = self.inventory.get(token_id, 0.0)
 
-        # Calculate quote prices
-        # Base quotes: slightly inside the market
         base_bid = round(mid - self.quote_offset, 2)
         base_ask = round(mid + self.quote_offset, 2)
 
-        # Inventory skew: if we're long, lower our bid and raise our ask
-        # to encourage selling and discourage buying
         skew = 0.0
         if abs(current_inventory) > 1.0:
-            # Skew by 0.5 cents per $5 of inventory
             skew = (current_inventory / 5.0) * 0.005
 
         bid_price = max(0.01, round(base_bid - skew, 2))
         ask_price = min(0.99, round(base_ask - skew, 2))
 
-        # Ensure we maintain minimum spread after skew
         if ask_price - bid_price < self.min_spread / 2:
             return []
 
-        # Calculate sizes based on depth and inventory limits
         bid_size = min(self.max_size_per_side, book.bid_depth_usd * 0.1)
         ask_size = min(self.max_size_per_side, book.ask_depth_usd * 0.1)
 
-        # Reduce size on side where we have inventory
         if current_inventory > 2.0:
-            bid_size *= 0.5  # Reduce buying
+            bid_size *= 0.5
         elif current_inventory < -2.0:
-            ask_size *= 0.5  # Reduce selling
+            ask_size *= 0.5
 
         orders = []
 
-        # Only post orders if they would be inside the market
         if bid_price < book.best_ask and bid_size >= 1.0:
             orders.append({
                 "side": "BUY",
@@ -345,7 +392,7 @@ class SpreadMakerStrategy(BaseStrategy):
                 "price": bid_price,
                 "size": bid_size,
                 "order_type": "GTC",
-                "reason": f"spread_maker_bid_{spread:.2f}"
+                "reason": f"spread_maker_bid_{spread:.2f}",
             })
 
         if ask_price > book.best_bid and ask_size >= 1.0:
@@ -355,10 +402,11 @@ class SpreadMakerStrategy(BaseStrategy):
                 "price": ask_price,
                 "size": ask_size,
                 "order_type": "GTC",
-                "reason": f"spread_maker_ask_{spread:.2f}"
+                "reason": f"spread_maker_ask_{spread:.2f}",
             })
 
         if orders:
+            self._last_quote_time[token_id] = now
             logger.info(
                 f"SpreadMaker: spread={spread:.3f}, mid={mid:.3f}, "
                 f"bid={bid_price}, ask={ask_price}, inventory={current_inventory:.2f}"
@@ -368,15 +416,37 @@ class SpreadMakerStrategy(BaseStrategy):
 
     async def on_order_update(self, order_id: str, new_state: str):
         """Track fills to update inventory."""
-        # Note: In a full implementation, we'd track which orders belong to this
-        # strategy and update inventory on fills. For now, inventory is tracked
-        # separately in the portfolio.
-        pass
+        if new_state == "filled":
+            # Find token for this order and update inventory
+            for token_id, order_ids in self._active_orders.items():
+                if order_id in order_ids:
+                    order_ids.remove(order_id)
+                    break
+
+    def track_order(self, token_id: str, client_order_id: str) -> None:
+        """Track a newly placed SpreadMaker order."""
+        if token_id not in self._active_orders:
+            self._active_orders[token_id] = []
+        self._active_orders[token_id].append(client_order_id)
 
     def update_inventory(self, token_id: str, delta: float) -> None:
         """Update inventory tracking after a fill."""
         current = self.inventory.get(token_id, 0.0)
         self.inventory[token_id] = current + delta
+
+    async def cleanup(self) -> None:
+        """Cancel all SpreadMaker orders on shutdown."""
+        if not self._order_manager:
+            return
+        for token_id, order_ids in self._active_orders.items():
+            for oid in order_ids:
+                order = self._order_manager.get_order(oid)
+                if order and order.state.is_active:
+                    try:
+                        await self._order_manager.cancel_order(order)
+                    except Exception:
+                        pass
+        self._active_orders.clear()
 
 
 # ==============================================================================
@@ -427,7 +497,8 @@ class LeggedHedgeStrategy(BaseStrategy):
                             "side": "BUY",
                             "token_id": context.market.yes_token_id,
                             "price": context.order_book.best_bid,
-                            "size": 5.0
+                            "size": 5.0,
+                            "_leg_context_id": m_id,
                         }
                         leg_ctx.state = LegState.LEG1_Open
                         return [order]
@@ -440,18 +511,29 @@ class LeggedHedgeStrategy(BaseStrategy):
         # 3. LEG1_FILLED -> Execute Hedge
         elif leg_ctx.state == LegState.LEG1_FILLED:
             # Check Hedge Condition: Sum < 0.95
-            book = context.order_book
-            if book and book.best_bid and book.best_ask:
-                # Assuming we bought YES, we want to buy NO.
-                # Simplistic hedge check
-                orders = [{
-                    "side": "BUY", # Opposite side
-                    "token_id": context.market.no_token_id, 
-                    "price": 1.0 - book.best_bid - 0.02, # Aggressive
-                    "size": leg_ctx.leg1_size # Hedge delta neutral or 1:1
-                }]
-                leg_ctx.state = LegState.HEDGING
-                return orders
+            if not context.market.no_token_id:
+                return []
+
+            no_book = context.order_book_no
+            no_price = None
+            if no_book and no_book.best_ask:
+                no_price = no_book.best_ask
+            elif context.market.no_price:
+                no_price = context.market.no_price
+
+            if no_price is None:
+                return []
+
+            hedge_size = leg_ctx.leg1_size if leg_ctx.leg1_size > 0 else 5.0
+            hedge_price = min(0.99, max(0.01, round(float(no_price), 2)))
+            orders = [{
+                "side": "BUY",  # Opposite side
+                "token_id": context.market.no_token_id,
+                "price": hedge_price,
+                "size": hedge_size,  # Hedge delta neutral or 1:1
+            }]
+            leg_ctx.state = LegState.HEDGING
+            return orders
 
         # 4. HEDGING -> Managed by on_order_update
         elif leg_ctx.state == LegState.HEDGING:

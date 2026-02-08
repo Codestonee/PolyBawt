@@ -26,6 +26,8 @@ api:
 trading:
   assets: ["BTC", "ETH"]  # Enabled for crypto strategy if needed
   bankroll: 100.0  # Assumed bankroll for % calcs if API fails
+  max_trade_usd: 5.0          # Grok spec: $5 max per trade
+  max_total_exposure_usd: 20.0  # Grok spec: $20 max exposure
   
   min_edge_threshold: 0.02  # 2% (Grok recommendation)
   kelly_fraction: 0.25      # Ensemble allocation
@@ -39,7 +41,7 @@ trading:
 
   arbitrage_enabled: true
   arbitrage_min_profit_pct: 0.005 # 0.5%
-  arbitrage_max_size: 0
+  arbitrage_max_size: 5.0
 
   extreme_prob_enabled: false  # Keep disabled for now
   extreme_prob_threshold: 0.05
@@ -50,9 +52,9 @@ trading:
 # Risk Management
 # -----------------------------------------------------------------------------
 risk:
-  daily_loss_soft_limit_pct: 0.40  # 40% warn
-  daily_loss_hard_limit_pct: 0.50  # 50% stop (Grok)
-  max_drawdown_pct: 0.50          # 50% max drawdown
+  daily_loss_soft_limit_pct: 0.03  # 3% warn
+  daily_loss_hard_limit_pct: 0.05  # 5% stop
+  max_drawdown_pct: 0.10           # 10% max drawdown
   volatility_pause_threshold: 2.0
   correlation_reduction_threshold: 0.8
 
@@ -72,7 +74,7 @@ execution:
 # Market Making - DISABLED
 # -----------------------------------------------------------------------------
 market_making:
-  enabled: true
+  enabled: false
   spread_bps: 50.0
   quote_size_usd: 0
   max_inventory_usd: 0

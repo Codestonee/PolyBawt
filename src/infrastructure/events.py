@@ -166,6 +166,7 @@ class EventBus:
         self._running = False
         self._processed_count = 0
         self._error_count = 0
+        self._dropped_count = 0
 
     def subscribe(
         self,
@@ -234,6 +235,7 @@ class EventBus:
         try:
             self._queue.put_nowait(event)
         except asyncio.QueueFull:
+            self._dropped_count += 1
             logger.warning("Event queue full, dropping event", event_type=event.event_type.value)
 
     async def process_queue(self) -> None:
@@ -269,6 +271,7 @@ class EventBus:
         return {
             "processed": self._processed_count,
             "errors": self._error_count,
+            "dropped": self._dropped_count,
             "queue_size": self._queue.qsize(),
             "handlers": sum(len(h) for h in self._handlers.values()) + len(self._all_handlers),
         }

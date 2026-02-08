@@ -8,6 +8,7 @@ from pydantic import BaseModel
 import traceback
 
 from src.api.state import get_state
+from src.infrastructure.events import event_bus
 from src.infrastructure.logging import get_logger
 
 logger = get_logger(__name__)
@@ -139,8 +140,41 @@ async def health_check():
         "bot_running": state.is_running,
         "is_live": state.is_live,
         "active_strategies": state.active_strategies,
-        "last_update": state.last_update
+        "last_update": state.last_update,
+        "event_bus": event_bus.stats,
     }
+
+
+@app.get("/ready")
+async def readiness_check():
+    """
+    Kubernetes readiness probe.
+    
+    Returns 200 if all dependencies are healthy, 503 otherwise.
+    """
+    state = get_state()
+    checks = {
+        "bot_initialized": state.portfolio is not None,
+        "event_bus_healthy": event_bus.stats.get("dropped", 0) == 0,
+    }
+    
+    # Check oracle health if available
+    oracle = getattr(state, "oracle", None)
+    if oracle:
+        health = getattr(oracle, "health", None)
+        if health:
+            checks["oracle_healthy"] = health.any_healthy
+            checks["oracle_price_age_ok"] = health.last_price_age_seconds < 30.0
+    
+    all_healthy = all(checks.values())
+    
+    return JSONResponse(
+        status_code=200 if all_healthy else 503,
+        content={
+            "ready": all_healthy,
+            "checks": checks,
+        }
+    )
 
 
 @app.get("/api/portfolio", response_model=PortfolioModel)

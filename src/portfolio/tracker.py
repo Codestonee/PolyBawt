@@ -29,6 +29,7 @@ class Position:
     
     # Identifiers
     token_id: str
+    condition_id: str
     asset: str
     market_question: str
     
@@ -42,6 +43,9 @@ class Position:
     opened_at: float = field(default_factory=time.time)
     expires_at: float = 0  # Market expiry
     
+    # Strategy attribution
+    strategy_id: str = ""
+
     # State
     closed: bool = False
     exit_price: float = 0
@@ -51,6 +55,11 @@ class Position:
     def current_value(self) -> float:
         """Current position value (at entry price)."""
         return self.shares * self.entry_price
+    
+    @property
+    def size(self) -> float:
+        """Position size in shares (alias for Reconciler compatibility)."""
+        return self.shares
     
     def unrealized_pnl(self, current_price: float) -> float:
         """Calculate unrealized PnL at current price."""
@@ -128,6 +137,7 @@ class Portfolio:
         # Open position
         position = portfolio.open_position(
             token_id="abc",
+            condition_id="cond123",
             asset="BTC",
             side=PositionSide.LONG_YES,
             price=0.55,
@@ -149,6 +159,7 @@ class Portfolio:
         self._positions: dict[str, Position] = {}
         self._closed_positions: list[Position] = []
         self._daily: dict[str, DailyPerformance] = {}
+        self._strategy_pnl: dict[str, float] = {}
 
         # All-time win/loss tracking
         self.total_wins: int = 0
@@ -177,18 +188,21 @@ class Portfolio:
     def open_position(
         self,
         token_id: str,
+        condition_id: str,
         asset: str,
         market_question: str,
         side: PositionSide,
         price: float,
         size_usd: float,
         expires_at: float = 0,
+        strategy_id: str = "",
     ) -> Position:
         """
         Open a new position.
         
         Args:
             token_id: Token identifier
+            condition_id: Market condition id
             asset: Asset (BTC, ETH, etc.)
             market_question: Market description
             side: LONG_YES or LONG_NO
@@ -200,9 +214,36 @@ class Portfolio:
             Position object
         """
         shares = size_usd / price if price > 0 else 0
-        
+
+        # Accumulate into existing position instead of overwriting
+        if token_id in self._positions:
+            existing = self._positions[token_id]
+            if not existing.condition_id:
+                existing.condition_id = condition_id
+            total_shares = existing.shares + shares
+            if total_shares > 0:
+                existing.entry_price = (existing.entry_price * existing.shares + price * shares) / total_shares
+            existing.shares = total_shares
+            existing.size_usd = existing.shares * existing.entry_price
+
+            daily = self._ensure_daily(self._today())
+            daily.trades_entered += 1
+
+            logger.info(
+                "Position accumulated",
+                token_id=token_id,
+                asset=asset,
+                side=side.value,
+                add_price=price,
+                add_size_usd=size_usd,
+                total_shares=total_shares,
+                avg_entry=existing.entry_price,
+            )
+            return existing
+
         position = Position(
             token_id=token_id,
+            condition_id=condition_id,
             asset=asset,
             market_question=market_question,
             side=side,
@@ -210,8 +251,9 @@ class Portfolio:
             size_usd=size_usd,
             shares=shares,
             expires_at=expires_at,
+            strategy_id=strategy_id,
         )
-        
+
         self._positions[token_id] = position
         
         daily = self._ensure_daily(self._today())
@@ -255,7 +297,13 @@ class Portfolio:
         
         self.current_capital += pnl
         self.peak_capital = max(self.peak_capital, self.current_capital)
-        
+
+        # Attribute PnL to strategy
+        if position.strategy_id:
+            self._strategy_pnl[position.strategy_id] = (
+                self._strategy_pnl.get(position.strategy_id, 0.0) + pnl
+            )
+
         daily = self._ensure_daily(self._today())
         daily.realized_pnl += pnl
         daily.trades_exited += 1
@@ -315,10 +363,44 @@ class Portfolio:
     
     def get_position(self, token_id: str) -> Position | None:
         return self._positions.get(token_id)
-    
+
+    def sync_position(self, token_id: str, size: float) -> None:
+        """
+        Sync local position to match exchange size.
+        
+        Used by Reconciler to fix position drift.
+        
+        Args:
+            token_id: Token to sync
+            size: Exchange-reported size in shares
+        """
+        position = self._positions.get(token_id)
+        if position:
+            old_size = position.shares
+            position.shares = size
+            position.size_usd = size * position.entry_price
+            logger.info(
+                "Position synced to exchange",
+                token_id=token_id,
+                old_size=old_size,
+                new_size=size,
+            )
+        elif size > 0:
+            # Position exists on exchange but not locally - log warning
+            logger.warning(
+                "Position on exchange not in local state",
+                token_id=token_id,
+                size=size,
+            )
+
     def get_open_positions(self) -> list[Position]:
         return list(self._positions.values())
-    
+
+    @property
+    def positions(self) -> dict[str, Position]:
+        """Public read access to positions dict."""
+        return self._positions
+
     def get_exposure_by_asset(self) -> dict[str, float]:
         """Get total exposure per asset."""
         exposure: dict[str, float] = {}
@@ -377,6 +459,22 @@ class Portfolio:
             return float("inf") if gross_profit > 0 else 0.0
         return gross_profit / gross_loss
     
+    def get_strategy_performance(self) -> dict[str, dict]:
+        """Get per-strategy performance breakdown."""
+        result: dict[str, dict] = {}
+        for strategy_id, pnl in self._strategy_pnl.items():
+            trades = [p for p in self._closed_positions if p.strategy_id == strategy_id]
+            wins = sum(1 for t in trades if t.realized_pnl >= 0)
+            losses = sum(1 for t in trades if t.realized_pnl < 0)
+            result[strategy_id] = {
+                "pnl": round(pnl, 4),
+                "trades": len(trades),
+                "wins": wins,
+                "losses": losses,
+                "win_rate": round(wins / len(trades) * 100, 1) if trades else 0.0,
+            }
+        return result
+
     def get_daily_performance(self, date: str | None = None) -> DailyPerformance:
         if date is None:
             date = self._today()
@@ -410,6 +508,7 @@ class Portfolio:
             "average_win": round(self.average_win, 2),
             "average_loss": round(self.average_loss, 2),
             "profit_factor": round(self.profit_factor, 2) if self.profit_factor != float("inf") else "inf",
+            "strategy_performance": self.get_strategy_performance(),
         }
 
     def save_state(self, filepath: str = "data/portfolio_state.json") -> None:

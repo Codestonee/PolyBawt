@@ -9,6 +9,7 @@ Wraps py-clob-client with:
 """
 
 import asyncio
+import math
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -61,6 +62,11 @@ class CLOBClient:
         )
     """
     
+    PRICE_TICK = 0.001
+    MIN_PRICE = 0.001
+    MAX_PRICE = 0.999
+    SIZE_STEP_SHARES = 0.01
+
     def __init__(
         self,
         dry_run: bool = True,
@@ -171,17 +177,46 @@ class CLOBClient:
             For Polymarket binary options: shares = usd / price
             Example: $10 at price 0.5 = 20 shares
         """
-        # Convert USD to shares
-        # For Polymarket binary options: shares = usd / price
-        if price <= 0:
+        # Enforce venue precision/steps before validation and submission.
+        raw_price = float(price)
+        price = round(round(raw_price / self.PRICE_TICK) * self.PRICE_TICK, 3)
+        price = min(self.MAX_PRICE, max(self.MIN_PRICE, price))
+
+        # FIX P1 #4: Validate price is in valid range for binary options (0 < price < 1)
+        if price <= 0 or price >= 1:
             return OrderResponse(
                 success=False,
                 error_code="INVALID_PRICE",
-                error_message=f"Price must be > 0, got {price}",
+                error_message=f"Price must be between 0 and 1 (exclusive), got {price}",
             )
 
+        # FIX P1 #6: Validate size is positive
+        if size <= 0:
+            return OrderResponse(
+                success=False,
+                error_code="INVALID_SIZE",
+                error_message=f"Size must be > 0, got {size}",
+            )
+
+        # Convert USD to shares
+        # For Polymarket binary options: shares = usd / price
         size_usd = size  # Keep original for logging
-        size_shares = size_usd / price
+        size_shares_raw = size_usd / price
+        size_shares = math.floor(size_shares_raw / self.SIZE_STEP_SHARES) * self.SIZE_STEP_SHARES
+        size_shares = round(size_shares, 8)
+        if size_shares <= 0:
+            return OrderResponse(
+                success=False,
+                error_code="INVALID_SIZE_STEP",
+                error_message=f"Size too small after step rounding, got {size_shares_raw}",
+            )
+
+        if abs(raw_price - price) > 1e-9:
+            logger.debug(
+                "Price rounded to exchange tick",
+                raw_price=raw_price,
+                rounded_price=price,
+            )
 
         # Rate limit
         wait_time = await self.rate_limiter.acquire_order()
@@ -622,6 +657,32 @@ class CLOBClient:
             
         except Exception as e:
             logger.error("Get trade history failed", error=str(e))
+            return []
+
+
+    async def get_positions(self) -> list[dict[str, Any]]:
+        """
+        Get open positions from exchange.
+        
+        Used by Reconciler for position sync.
+        
+        Returns:
+            List of position dicts with token_id and size
+        """
+        await self.rate_limiter.acquire_query()
+        
+        if not self._initialized or not self._clob_client:
+            return []
+        
+        try:
+            # py-clob-client get_positions returns account positions
+            positions = await asyncio.to_thread(
+                self._clob_client.get_positions
+            )
+            return positions or []
+            
+        except Exception as e:
+            logger.error("Get positions failed", error=str(e))
             return []
 
 

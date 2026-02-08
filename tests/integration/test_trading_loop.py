@@ -203,6 +203,7 @@ class TestTradingLoopIntegration:
         # Register pending fill metadata
         strategy._pending_fills[order.client_order_id] = PendingFill(
             token_id="test_token",
+            condition_id="cond_test",
             asset="BTC",
             side=PositionSide.LONG_YES,
             price=0.55,
@@ -211,8 +212,10 @@ class TestTradingLoopIntegration:
             expires_at=datetime.now(timezone.utc).timestamp() + 600,
         )
 
-        # Simulate fill
-        strategy.handle_fill(order.client_order_id, 10.0, 0.55)
+        # Simulate fill - handle_fill expects shares, not USD
+        # Order was 10 USD at 0.55, so shares = 10 / 0.55 ≈ 18.18
+        fill_shares = 10.0 / 0.55
+        strategy.handle_fill(order.client_order_id, fill_shares, 0.55)
 
         # Verify metrics updated
         assert strategy.metrics.orders_filled == 1

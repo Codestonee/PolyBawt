@@ -581,11 +581,26 @@ class OrderManager:
     def get_pending_orders(self) -> list[Order]:
         """Get orders waiting for exchange acknowledgment."""
         return [
-            self._orders[oid] 
-            for oid in self._pending_orders 
+            self._orders[oid]
+            for oid in self._pending_orders
             if oid in self._orders
         ]
-    
+
+    def get_pending_exposure(self) -> float:
+        """
+        Get total exposure of active (non-terminal) orders.
+
+        FIX P3 #9: Public API to avoid accessing private _orders directly.
+
+        Returns:
+            Total remaining size in USD of all non-terminal orders
+        """
+        exposure = 0.0
+        for order in self._orders.values():
+            if not order.state.is_terminal:
+                exposure += order.remaining_size
+        return exposure
+
     def handle_fill(
         self,
         client_order_id: str,
@@ -595,13 +610,21 @@ class OrderManager:
         """
         Handle fill event from exchange.
 
+        FIX P0 #3: Document units clearly.
+
         Args:
             client_order_id: Order that was filled
-            fill_size: Size filled in this event
-            fill_price: Price of this fill
+            fill_size: Size filled in USD (same units as Order.size).
+                       If exchange returns shares, caller must convert:
+                       fill_usd = fill_shares * fill_price
+            fill_price: Price per share at fill
 
         Returns:
             True if fill was applied
+
+        Note:
+            Order.size is stored in USD. fill_size must also be in USD
+            to correctly compute fill_pct = filled_size / size.
         """
         order = self._orders.get(client_order_id)
         if order is None:

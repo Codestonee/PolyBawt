@@ -21,11 +21,15 @@ from src.api.state import get_state
 from src.execution.clob_client import CLOBClient
 from src.execution.order_manager import OrderManager
 from src.execution.rate_limiter import RateLimiter, rate_limiter
-from src.infrastructure.config import init_config, AppConfig, load_config
+from src.execution.reconciler import Reconciler
+from src.infrastructure.config import init_config, AppConfig, load_config, load_secrets
+from src.infrastructure.events import event_bus, event_logger, EventType
 from src.infrastructure.kill_switch import kill_switch, KillSwitchEvent, KillSwitchType
 from src.infrastructure.logging import bind_context, get_logger, configure_logging
+from src.infrastructure.metrics import metrics
 from src.ingestion.market_discovery import MarketDiscovery
 from src.ingestion.oracle_feed import OracleFeed
+from src.ingestion.ws_client import WebSocketClient
 from src.portfolio.tracker import Portfolio
 from src.risk.circuit_breaker import CircuitBreaker, CircuitBreakerConfig
 from src.strategy.value_betting import EnsembleStrategy
@@ -34,16 +38,19 @@ from src.strategy.value_betting import EnsembleStrategy
 async def run_crypto_strategy(config: AppConfig) -> None:
     """Initialize and run the value betting strategy."""
     logger = get_logger(__name__)
-    
+
     logger.info(
         "Initializing components",
         environment=config.environment,
         dry_run=config.dry_run,
     )
-    
+
     # Initialize components
     market_discovery = MarketDiscovery(base_url=config.api.gamma_base_url)
-    oracle = OracleFeed(use_websocket=True)
+    oracle = OracleFeed(
+        use_websocket=True,
+        require_chainlink_in_live=not config.dry_run,
+    )
     rate_limiter = RateLimiter()
 
     # Start WebSocket for real-time price feeds
@@ -53,16 +60,15 @@ async def run_crypto_strategy(config: AppConfig) -> None:
     else:
         logger.info("Using REST API price polling (WebSocket unavailable)")
 
-    # FIX #3: Initialize CLOB client for order book pricing AND order execution
+    # Initialize CLOB client
     clob_client = CLOBClient(
         dry_run=config.dry_run,
         rate_limiter=rate_limiter,
     )
     await clob_client.initialize()
 
-    # Create submit callback that uses CLOBClient for live orders
+    # Create submit callback
     async def submit_order_callback(order):
-        """Submit order to exchange via CLOB client."""
         return await clob_client.place_order(
             token_id=order.token_id,
             side=order.side.value,
@@ -72,12 +78,11 @@ async def run_crypto_strategy(config: AppConfig) -> None:
         )
 
     order_manager = OrderManager(
-        dry_run=config.dry_run, 
+        dry_run=config.dry_run,
         rate_limiter=rate_limiter,
         submit_callback=submit_order_callback if not config.dry_run else None,
     )
 
-    # Values for initialization
     bankroll = config.trading.bankroll
 
     cb_config = CircuitBreakerConfig(
@@ -102,8 +107,49 @@ async def run_crypto_strategy(config: AppConfig) -> None:
     except Exception as e:
         logger.warning(f"Failed to sync real balance (using config default): {e}")
 
+    # === Wire EventBus ===
+    event_bus.subscribe_all(event_logger.handle)
+    event_bus_task = asyncio.create_task(event_bus.run())
+    logger.info("Event bus started")
+
+    # === Wire MetricsCollector ===
+    try:
+        metrics.start_server(port=config.observability.metrics_port)
+        metrics.set_bot_info(version="1.1.0", environment=config.environment)
+        logger.info("Metrics server started", port=config.observability.metrics_port)
+    except Exception as e:
+        logger.warning(f"Metrics server failed to start: {e}")
+
+    # === Wire Reconciler ===
+    reconciler = Reconciler(
+        order_manager=order_manager,
+        clob_client=clob_client,
+        portfolio=portfolio,
+    )
+    await reconciler.start_periodic(interval_seconds=30)
+    logger.info("Reconciler started (30s interval)")
+
+    # === Wire WebSocket fill listener ===
+    ws_fill_client = None
+    secrets = load_secrets()
+    if secrets.polymarket_api_key and not config.dry_run:
+        try:
+            ws_fill_client = WebSocketClient(
+                url=config.api.ws_url,
+                api_key=secrets.polymarket_api_key,
+                api_secret=secrets.polymarket_api_secret,
+                api_passphrase=secrets.polymarket_passphrase,
+            )
+            await ws_fill_client.connect()
+            await ws_fill_client.subscribe_user()
+            logger.info("WebSocket fill listener connected")
+        except Exception as e:
+            logger.warning(f"WebSocket fill listener failed: {e}")
+            ws_fill_client = None
+
     # Sync to global state
     get_state().portfolio = portfolio
+    get_state().order_manager = order_manager
 
     # Instantiate Strategy
     logger.info("Instantiating EnsembleStrategy...")
@@ -123,8 +169,22 @@ async def run_crypto_strategy(config: AppConfig) -> None:
         logger.exception(f"CRITICAL: Failed to create ensemble: {e}")
         return
 
+    # Register WebSocket fill handler
+    if ws_fill_client:
+        async def ws_fill_handler(msg):
+            """Route WebSocket fills to strategy."""
+            data = msg.data
+            client_order_id = data.get("client_order_id") or data.get("order_id", "")
+            fill_size = float(data.get("size", 0))
+            fill_price = float(data.get("price", 0))
+            if client_order_id and fill_size > 0 and fill_price > 0:
+                strategy.handle_fill(client_order_id, fill_size, fill_price)
+
+        ws_fill_client.on("trade", ws_fill_handler)
+        ws_fill_client.on("last_trade_price", ws_fill_handler)
+
     logger.info("Grok Ensemble ready. Starting main loop...")
-    
+
     try:
         await strategy.run()
     except asyncio.CancelledError:
@@ -132,12 +192,60 @@ async def run_crypto_strategy(config: AppConfig) -> None:
     except Exception as e:
         logger.exception(f"Strategy loop crashed: {e}")
     finally:
+        # === Graceful shutdown ===
+        logger.info("Beginning graceful shutdown...")
+
+        # 1. Stop strategy
+        strategy.stop()
+
+        # 2. Cancel all open orders
+        try:
+            cancelled = await order_manager.cancel_all_orders()
+            logger.info(f"Cancelled {cancelled} open orders on shutdown")
+        except Exception as e:
+            logger.error(f"Failed to cancel orders on shutdown: {e}")
+
+        # 3. Cleanup SpreadMaker orders
+        spread_maker = strategy.strategies.get("SpreadMaker")
+        if spread_maker and hasattr(spread_maker, 'cleanup'):
+            try:
+                await spread_maker.cleanup()
+            except Exception:
+                pass
+
+        # 4. Save portfolio state
+        portfolio.save_state()
+        logger.info("Portfolio state saved")
+
+        # 5. Log final summary
+        summary = portfolio.summary()
+        logger.info(
+            "Final portfolio summary",
+            capital=f"${summary['current_capital']:.2f}",
+            pnl=f"${summary['realized_pnl']:.2f}",
+            trades=summary['total_trades'],
+            win_rate=f"{summary['win_rate']}%",
+        )
+
+        # 6. Stop reconciler
+        await reconciler.stop()
+
+        # 7. Stop event bus
+        event_bus.stop()
+        event_bus_task.cancel()
+        try:
+            await event_bus_task
+        except asyncio.CancelledError:
+            pass
+
+        # 8. Close WebSocket clients
+        if ws_fill_client:
+            await ws_fill_client.close()
+
+        # 9. Close other connections
         await market_discovery.close()
         await oracle.close()
         logger.info("Strategy cleanup complete.")
-
-
-
 
 
 def parse_args() -> argparse.Namespace:
@@ -178,31 +286,31 @@ def parse_args() -> argparse.Namespace:
 async def async_main() -> None:
     """Async entry point."""
     args = parse_args()
-    
+
     # Load configuration
     config, secrets = init_config(args.config)
-    
+
     # Safety check for production
     if config.environment == "production" and not args.live:
         print("ERROR: Production config requires --live flag")
         print("This is a safety measure to prevent accidental live trading")
         sys.exit(1)
-    
+
     # Override dry_run depending on --live flag
     if args.live:
-        config.dry_run = False  # Force live
+        config.dry_run = False
     else:
-        config.dry_run = True   # Force paper
-    
+        config.dry_run = True
+
     # Configure logging
     log_format = "clean" if args.clean else config.observability.log_format
     log_level = "DEBUG" if args.verbose else config.observability.log_level
-    
+
     configure_logging(
         log_level=log_level,
         log_format=log_format,
     )
-    
+
     logger = get_logger(__name__)
     logger.info(
         "Polymarket 15m Trading Bot starting",
@@ -218,7 +326,7 @@ async def async_main() -> None:
 
     api_config = uvicorn.Config(app, host="127.0.0.1", port=config.observability.metrics_port, log_level="error")
     server = uvicorn.Server(api_config)
-    
+
     # Run API server concurrently with strategy
     api_task = asyncio.create_task(server.serve())
     get_state().is_running = True
@@ -232,20 +340,23 @@ async def async_main() -> None:
         "Legged Hedge": True,
         "Circuit Breaker": True,
         "VPIN Filter": True,
+        "RiskGate": True,
+        "Sniper Protection": True,
+        "Reconciler": True,
     }
     get_state().active_strategies = strategies
 
-    # Print Easy-to-Read Terminal Output
-    print("\n" + "="*60)
-    print(f"🤖 POLYMARKET BOT - {'LIVE TRADING 🔴' if args.live else 'PAPER TRADING ⚪'}")
-    print("="*60)
+    # Print terminal output
+    print("\n" + "=" * 60)
+    print(f"POLYMARKET BOT - {'LIVE TRADING' if args.live else 'PAPER TRADING'}")
+    print("=" * 60)
     print(f"{'STRATEGY':<25} | {'STATUS':<10} | {'MODE':<10}")
     print("-" * 50)
     for name, enabled in strategies.items():
-        status = "✅ ON" if enabled else "❌ OFF"
-        mode = "Auto" if name != "Market Making" else "Manual"
+        status = "ON" if enabled else "OFF"
+        mode = "Auto"
         print(f"{name:<25} | {status:<10} | {mode:<10}")
-    print("="*60 + "\n")
+    print("=" * 60 + "\n")
 
     # Set up kill switch monitoring
     active_tasks = []
@@ -253,19 +364,26 @@ async def async_main() -> None:
     async def on_kill_switch(event: KillSwitchEvent):
         """Handle kill switch trigger."""
         logger.critical("Kill switch activated")
+
+        state = get_state()
+        if state.order_manager:
+            try:
+                cancelled = await state.order_manager.cancel_all_orders()
+                logger.critical(f"Kill switch: cancelled {cancelled} open orders")
+            except Exception as e:
+                logger.error(f"Failed to cancel orders on kill switch: {e}")
+
         for t in active_tasks:
             if not t.done():
                 t.cancel()
-    
+
     kill_switch.register_callback(on_kill_switch)
     await kill_switch.start_monitoring()
-    
+
     try:
-        # Run strategy concurrently
         crypto_task = asyncio.create_task(run_crypto_strategy(config))
         active_tasks.append(crypto_task)
-        
-        # Monitor for kill switch in parallel
+
         async def kill_switch_monitor():
             while True:
                 if await kill_switch.check():
@@ -273,27 +391,24 @@ async def async_main() -> None:
                     crypto_task.cancel()
                     break
                 await asyncio.sleep(1.0)
-        
+
         monitor_task = asyncio.create_task(kill_switch_monitor())
         active_tasks.append(monitor_task)
-        
-        # Use asyncio.wait to exit if ANY task finishes (e.g. crash)
+
         done, pending = await asyncio.wait(
             [crypto_task, monitor_task],
-            return_when=asyncio.FIRST_COMPLETED
+            return_when=asyncio.FIRST_COMPLETED,
         )
-        
-        # Check for exceptions in done tasks
+
         for task in done:
             if task.exception():
                 logger.error(f"Task failed with exception: {task.exception()}")
             else:
                 logger.info(f"Task completed: {task}")
-        
-        # Cancel remaining tasks
+
         for task in pending:
             task.cancel()
-        
+
     except asyncio.CancelledError:
         logger.info("Main loop cancelled")
     except Exception as e:

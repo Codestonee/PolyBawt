@@ -8,6 +8,7 @@ from src.portfolio.tracker import Portfolio
 class BotState:
     """Shared state between trading bot and API."""
     portfolio: Portfolio | None = None
+    order_manager: Any | None = None  # OrderManager for kill switch access
     active_orders: List[Any] = field(default_factory=list)
     recent_signals: List[Any] = field(default_factory=list)
     is_running: bool = False

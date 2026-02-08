@@ -34,6 +34,8 @@ trading:
 
   # Starting bankroll - UPDATE THIS to your actual balance
   bankroll: 72.08
+  max_trade_usd: 5.0  # Grok spec: $5 max per trade
+  max_total_exposure_usd: 20.0  # Grok spec: $20 max exposure
 
   # Minimum edge required after fees
   # Research (claude.md): "Fee at p=0.5 is ~3.125%, so 4% edge is minimum for profit"

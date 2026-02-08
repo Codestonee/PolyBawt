@@ -30,6 +30,9 @@ class TradingConfig(BaseModel):
     
     assets: list[str] = Field(default_factory=lambda: ["BTC", "ETH", "SOL", "XRP"])
     bankroll: float = 50.0  # Starting capital in USD
+    max_trade_usd: float = 5.0  # Max USD per single trade (Grok spec)
+    max_total_exposure_usd: float = 20.0  # Max total portfolio exposure (Grok spec)
+    max_position_per_token_usd: float = 10.0  # Cap concentration on a single token
     min_edge_threshold: float = 0.04  # 4% after fees
     kelly_fraction: float = 0.25  # 1/4 Kelly
     max_position_pct: float = 0.02  # 2% per trade
@@ -55,6 +58,11 @@ class TradingConfig(BaseModel):
     # Execution hygiene
     gtc_max_spread: float = 0.02  # absolute spread; kept for backward compatibility
     gtc_max_spread_bps: float = 0.0  # if >0, prefer IOC when spread/mid exceeds this
+    order_book_ttl_seconds: float = 5.0  # Freshness threshold for cached books
+    allow_heuristic_settlement_fallback: bool = False
+    market_concurrency: int = 1  # >1 enables bounded concurrent market scans
+    inter_market_jitter_ms_min: int = 100
+    inter_market_jitter_ms_max: int = 500
 
     # Order sizing
     min_order_size_usd: float = 5.0
@@ -86,6 +94,27 @@ class TradingConfig(BaseModel):
     def validate_edge(cls, v: float) -> float:
         if v < 0:
             raise ValueError("min_edge_threshold must be non-negative")
+        return v
+
+    @field_validator("max_position_per_token_usd", "order_book_ttl_seconds")
+    @classmethod
+    def validate_positive(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError("value must be > 0")
+        return v
+
+    @field_validator("market_concurrency")
+    @classmethod
+    def validate_market_concurrency(cls, v: int) -> int:
+        if v < 1 or v > 32:
+            raise ValueError("market_concurrency must be between 1 and 32")
+        return v
+
+    @field_validator("inter_market_jitter_ms_min", "inter_market_jitter_ms_max")
+    @classmethod
+    def validate_jitter_ms(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("jitter values must be >= 0")
         return v
 
 
@@ -137,6 +166,8 @@ class VPINConfig(BaseModel):
     n_buckets: int = 50  # Rolling window size
     halt_threshold: float = 0.6  # VPIN level to halt trading
     reduce_threshold: float = 0.4  # VPIN level to reduce size
+    use_order_book_proxy: bool = False  # False by default: depth snapshots are not trade flow
+    require_reliable: bool = True  # Apply VPIN only after enough completed buckets
 
 
 class OBIConfig(BaseModel):
