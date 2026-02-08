@@ -206,6 +206,12 @@ class OracleFeed:
         self._ws_reconnect_delay = 0.1  # Start at 100ms
         self._ws_max_reconnect_delay = 30.0  # Max 30s
     
+    @property
+    def _has_chainlink(self) -> bool:
+        """Check if Chainlink credentials are configured."""
+        return bool(self._chainlink_client_id and self._chainlink_client_secret)
+
+    
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create HTTP session."""
         if self._session is None or self._session.closed:
@@ -238,6 +244,12 @@ class OracleFeed:
         """
         Get current price for asset.
         
+        Priority (P1.7 Chainlink-as-truth):
+        1. Chainlink Data Streams (if credentials configured) - settlement truth
+        2. Binance WebSocket/REST (fallback for latency)
+        3. Coinbase (secondary fallback)
+        4. Stale cache (last resort)
+        
         Args:
             asset: Asset symbol (BTC, ETH, SOL, XRP)
         
@@ -249,7 +261,24 @@ class OracleFeed:
         if cached and cached.age_seconds < self.stale_threshold:
             return cached.price
         
-        # Try Binance first
+        # === P1.7: Chainlink-as-truth ===
+        # Prefer Chainlink when credentials are available
+        if self._has_chainlink:
+            chainlink_price = await self.get_chainlink_price(asset)
+            if chainlink_price is not None:
+                self._cache[asset] = PriceTick(
+                    asset=asset, price=chainlink_price, source="chainlink"
+                )
+                logger.debug(
+                    f"[Oracle] Chainlink price for {asset}: ${chainlink_price:.2f}"
+                )
+                return chainlink_price
+            # Chainlink failed but we have credentials - log warning
+            logger.warning(
+                f"[Oracle] Chainlink fetch failed for {asset}, falling back to Binance"
+            )
+        
+        # Fallback to Binance 
         price = await self._get_binance_price(asset)
         if price is not None:
             self._cache[asset] = PriceTick(asset=asset, price=price, source="binance")
