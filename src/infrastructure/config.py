@@ -181,6 +181,7 @@ class OBIConfig(BaseModel):
 
 
 class ArbTakerTuning(BaseModel):
+    enabled: bool = False  # DECOMMISSIONED: negative-EV post fee-change
     long_arb_threshold: float = 0.98
     short_arb_threshold: float = 1.02
     min_profit_pct: float = 0.005
@@ -189,6 +190,7 @@ class ArbTakerTuning(BaseModel):
 
 
 class LatencySnipeTuning(BaseModel):
+    enabled: bool = False  # DECOMMISSIONED: non-competitive latency vs HFT
     window_seconds: int = 120
     min_spot_delta_pct: float = 0.02
     lag_threshold_pct: float = 0.01
@@ -196,13 +198,17 @@ class LatencySnipeTuning(BaseModel):
 
 
 class SpreadMakerTuning(BaseModel):
-    min_spread: float = 0.05
+    enabled: bool = True  # PRIMARY STRATEGY: maker-rebate aligned
+    min_spread: float = 0.02  # Narrowed for competitive flow capture
     quote_offset: float = 0.01
     max_size_per_side_usd: float = 5.0
     order_refresh_time_seconds: float = 15.0
+    vpin_spread_multiplier: float = 2.0  # Widen spread when VPIN elevated
+    settlement_guard_seconds: int = 60  # Pull quotes before expiry
 
 
 class LeggedHedgeTuning(BaseModel):
+    enabled: bool = False  # DECOMMISSIONED: unquantifiable gamma risk
     crash_drop_threshold_pct: float = 0.15
     default_leg_size_usd: float = 5.0
 

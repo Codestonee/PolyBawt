@@ -327,6 +327,13 @@ class SpreadMakerStrategy(BaseStrategy):
         self.quote_offset = tuning.quote_offset
         self.max_size_per_side = tuning.max_size_per_side_usd
         self.order_refresh_time = tuning.order_refresh_time_seconds
+        self.vpin_spread_multiplier = getattr(tuning, 'vpin_spread_multiplier', 2.0)
+        self.settlement_guard_seconds = getattr(tuning, 'settlement_guard_seconds', 60)
+
+        # VPIN thresholds from config
+        vpin_config = config.vpin
+        self.vpin_reduce_threshold = vpin_config.reduce_threshold  # Widen spread
+        self.vpin_halt_threshold = vpin_config.halt_threshold  # Stop quoting
 
         # Track inventory for skewing
         self.inventory: Dict[str, float] = {}
@@ -342,12 +349,43 @@ class SpreadMakerStrategy(BaseStrategy):
         if not book or not book.best_bid or not book.best_ask:
             return []
 
-        spread = book.best_ask - book.best_bid
-        if spread < self.min_spread:
-            return []
-
         token_id = context.market.yes_token_id
         now = time.time()
+
+        # === TOXICITY GATE ===
+        vpin_value = getattr(context, 'vpin', None) or 0.0
+        time_to_expiry = getattr(context, 'time_to_expiry_seconds', float('inf'))
+
+        # Settlement boundary guard: pull quotes near expiry
+        if time_to_expiry < self.settlement_guard_seconds:
+            logger.info(
+                f"[SpreadMaker] Settlement guard: {time_to_expiry:.0f}s to expiry, "
+                "pulling all quotes"
+            )
+            return []
+
+        # VPIN halt: completely stop quoting in toxic regime
+        if vpin_value >= self.vpin_halt_threshold:
+            logger.warning(
+                f"[SpreadMaker] Toxicity HALT: VPIN={vpin_value:.3f} >= "
+                f"{self.vpin_halt_threshold}, pulling quotes"
+            )
+            return []
+
+        # VPIN reduce: widen spreads in elevated toxicity
+        spread_multiplier = 1.0
+        if vpin_value >= self.vpin_reduce_threshold:
+            spread_multiplier = self.vpin_spread_multiplier
+            logger.info(
+                f"[SpreadMaker] Toxicity WIDEN: VPIN={vpin_value:.3f} >= "
+                f"{self.vpin_reduce_threshold}, spread multiplier={spread_multiplier}x"
+            )
+
+        effective_min_spread = self.min_spread * spread_multiplier
+
+        spread = book.best_ask - book.best_bid
+        if spread < effective_min_spread:
+            return []
 
         # Rate limit requoting
         last_quote = self._last_quote_time.get(token_id, 0.0)
