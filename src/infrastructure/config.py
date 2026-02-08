@@ -180,6 +180,40 @@ class OBIConfig(BaseModel):
     weighted: bool = True  # Weight volume by distance from mid
 
 
+class ArbTakerTuning(BaseModel):
+    long_arb_threshold: float = 0.98
+    short_arb_threshold: float = 1.02
+    min_profit_pct: float = 0.005
+    max_arb_size_usd: float = 5.0
+    slippage_per_leg_pct: float = 0.002  # conservative slippage haircut
+
+
+class LatencySnipeTuning(BaseModel):
+    window_seconds: int = 120
+    min_spot_delta_pct: float = 0.02
+    lag_threshold_pct: float = 0.01
+    max_position_size_usd: float = 5.0
+
+
+class SpreadMakerTuning(BaseModel):
+    min_spread: float = 0.05
+    quote_offset: float = 0.01
+    max_size_per_side_usd: float = 5.0
+    order_refresh_time_seconds: float = 15.0
+
+
+class LeggedHedgeTuning(BaseModel):
+    crash_drop_threshold_pct: float = 0.15
+    default_leg_size_usd: float = 5.0
+
+
+class StrategyTuningConfig(BaseModel):
+    arb_taker: ArbTakerTuning = Field(default_factory=ArbTakerTuning)
+    latency_snipe: LatencySnipeTuning = Field(default_factory=LatencySnipeTuning)
+    spread_maker: SpreadMakerTuning = Field(default_factory=SpreadMakerTuning)
+    legged_hedge: LeggedHedgeTuning = Field(default_factory=LeggedHedgeTuning)
+
+
 class EventTradingConfig(BaseModel):
     """Event market trading parameters."""
 
@@ -242,6 +276,8 @@ class ObservabilityConfig(BaseModel):
     log_format: str = "json"  # json or text
     metrics_port: int = 9090
     telegram_enabled: bool = False
+    research_capture_enabled: bool = False
+    research_capture_dir: str = "data/research"
 
 
 class SecretsConfig(BaseSettings):
@@ -286,6 +322,7 @@ class AppConfig(BaseModel):
     market_making: MarketMakingConfig = Field(default_factory=MarketMakingConfig)
     vpin: VPINConfig = Field(default_factory=VPINConfig)
     obi: OBIConfig = Field(default_factory=OBIConfig)
+    strategy_tuning: StrategyTuningConfig = Field(default_factory=StrategyTuningConfig)
     event_trading: EventTradingConfig = Field(default_factory=EventTradingConfig)
     btc_15m: BTC15mConfig = Field(default_factory=BTC15mConfig)
 

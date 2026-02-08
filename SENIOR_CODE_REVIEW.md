@@ -9,7 +9,7 @@
 ## 1. Graded Assessment by Subsystem
 
 | Subsystem | Score | Weight | Weighted |
-|-----------|-------|--------|----------|
+| :--- | :--- | :--- | :--- |
 | Strategy Logic Quality | 6.5/10 | 12% | 0.78 |
 | Alpha/Signal Integrity | 5.5/10 | 15% | 0.83 |
 | Risk Management & Controls | 6.0/10 | 18% | 1.08 |
@@ -22,6 +22,7 @@
 | **Production Readiness** | **5.7/10** | — | **5.72** |
 
 ### Weighting Rationale
+
 - **Risk/Execution (33%)**: Trading systems fail at execution; risk controls are table stakes
 - **Alpha/Strategy (27%)**: Useless without edge; strategy correctness is profit-critical
 - **Portfolio (12%)**: Incorrect accounting = invisible P&L leaks
@@ -33,23 +34,29 @@
 ### Detailed Subsystem Analysis
 
 #### Strategy Logic Quality: 6.5/10
+
 **What's Good**:
+
 - Clean strategy abstraction via `BaseStrategy` + `TradeContext`
 - Per-strategy circuit breakers with size_multiplier degradation
 - OBI/VPIN integration for signal confidence adjustment
 
 **What Prevents 8+**:
+
 - `LeggedHedge` state machine is incomplete (hedge price formula is naive: `1.0 - book.best_bid - 0.02`)
 - Short arbitrage detected but not executed (dead code path)
 - Hardcoded thresholds instead of config-driven parameters
 - No backtesting validation of strategy edge
 
 #### Alpha/Signal Integrity: 5.5/10
+
 **What's Good**:
+
 - Latency snipe concept is sound (spot→options price lag exploitation)
 - Arb detection math is correct for long arb case
 
 **What Prevents 8+**:
+
 - **CRITICAL**: Settlement outcome hardcoded to `True` (line 318 `value_betting.py`)
 - VPIN uses order book snapshots as trade flow proxy (fundamentally incorrect)
 - No oracle freshness gates before signal generation
@@ -57,13 +64,16 @@
 - No signal decay / time-to-expiry scaling
 
 #### Risk Management & Controls: 6.0/10
+
 **What's Good**:
+
 - Multi-tier circuit breakers (soft/hard trips)
 - Correlation-adjusted sizing via `correlation_matrix`
 - Sniper risk detection framework exists
 - RiskGate validates all signals before execution
 
 **What Prevents 8+**:
+
 - Chainlink fallback to Binance defeats sniper protection purpose
 - No per-token position limits (strategies can pile on same token)
 - Daily loss and drawdown breakers never auto-reset (by design, but no manual reset API)
@@ -71,13 +81,16 @@
 - No exposure concentration limits by asset class
 
 #### Execution Reliability: 6.0/10
+
 **What's Good**:
+
 - Retry logic with exponential backoff for 500 errors
 - OrderManager state machine with persistence
 - Reconciler syncs with exchange every 30s
 - Rate limiter with order/query separation
 
 **What Prevents 8+**:
+
 - No idempotency keys passed to exchange (duplicate risk on retry)
 - Order size not rounded to exchange tick size (rejection risk)
 - Cancel response handling assumes success on non-error
@@ -85,13 +98,16 @@
 - WebSocket fill handler has no sequence number validation
 
 #### Portfolio/Accounting: 5.5/10
+
 **What's Good**:
+
 - Position accumulation with weighted average entry price
 - Atomic file persistence with temp→rename pattern
 - Per-strategy P&L attribution
 - Win/loss streak tracking
 
 **What Prevents 8+**:
+
 - **CRITICAL**: Settlement uses placeholder `outcome=True`
 - Unrealized P&L calculation requires manual price dict (not automated)
 - No mark-to-market revaluation loop
@@ -99,11 +115,14 @@
 - No reconciliation with exchange position state
 
 #### Async/Concurrency Safety: 5.0/10
+
 **What's Good**:
+
 - `asyncio.gather` for parallel order book fetches
 - Background tasks for event bus and reconciler
 
 **What Prevents 8+**:
+
 - `publish_sync()` called from async functions (event loop blocking)
 - No locks on shared state (`_pending_fills`, `_order_book_cache`, `positions`)
 - `handle_fill()` is sync but called from async WebSocket handler
@@ -111,13 +130,16 @@
 - Order listener callback creates tasks without tracking
 
 #### Observability/Operability: 6.5/10
+
 **What's Good**:
+
 - Structured logging with `structlog`
 - Prometheus metrics for PnL, win rate, portfolio
 - Event bus with audit trail
 - API server for dashboard integration
 
 **What Prevents 8+**:
+
 - No `/health` or `/ready` endpoints
 - Missing latency histograms for order lifecycle
 - No alerting integration (Telegram disabled by default)
@@ -125,23 +147,29 @@
 - No runbook documentation for operational incidents
 
 #### Security/Secrets Handling: 6.0/10
+
 **What's Good**:
+
 - Secrets loaded from environment variables only
 - `SecretsConfig` separate from `AppConfig`
 - Production requires explicit `--live` flag
 
 **What Prevents 8+**:
+
 - Private key stored in env (no HSM/vault integration)
 - API credentials logged in error messages (risk of exposure)
 - No secret rotation mechanism
 - Missing audit log for sensitive operations
 
 #### Test Quality: 3.0/10
+
 **What's Good**:
+
 - Basic unit test structure exists
 - Chaos test file present (`test_chaos.py`)
 
 **What Prevents 8+**:
+
 - Integration tests may hit real APIs (no mocking)
 - No deterministic replay tests
 - No edge case coverage (settlement, reconciliation failures)
@@ -150,12 +178,12 @@
 
 ---
 
-## 2. Top Findings by Severity
+### 2. Top Findings by Severity
 
 ### 🔴 CRITICAL (Must Fix Before Any Live Trading)
 
 | ID | Finding | Location | Risk |
-|----|---------|----------|------|
+| :--- | :--- | :--- | :--- |
 | C1 | **Settlement outcome hardcoded to `True`** | `value_betting.py:318-320` | All P&L calculations wrong; positions may show profit when they lost |
 | C2 | **No Chainlink credentials = sniper protection disabled** | `oracle_feed.py:412-418` | HFT bots can frontrun stale orders; guaranteed adverse selection |
 | C3 | **`publish_sync()` blocks event loop** | `value_betting.py:344,653,737` | Strategy loop hangs under load; missed trading opportunities |
@@ -165,7 +193,7 @@
 ### 🟠 HIGH (Fix Before Production)
 
 | ID | Finding | Location | Risk |
-|----|---------|----------|------|
+| :--- | :--- | :--- | :--- |
 | H1 | VPIN uses order book as trade flow proxy | `value_betting.py:434-441` | Toxicity filter makes wrong decisions |
 | H2 | Short arbitrage detected but not executed | `strategies.py:112-128` | Missing revenue; incomplete feature |
 | H3 | Order size not rounded to tick size | `clob_client.py:190-193` | Order rejections from exchange |
@@ -178,7 +206,7 @@
 ### 🟡 MEDIUM (Fix for Reliability)
 
 | ID | Finding | Location | Risk |
-|----|---------|----------|------|
+| :--- | :--- | :--- | :--- |
 | M1 | Closed positions array unbounded | `tracker.py:288` | Memory growth |
 | M2 | No market discovery retry logic | `market_discovery.py` | Missing markets |
 | M3 | Hardcoded strategy thresholds | `strategies.py:*` | No A/B testing |
@@ -195,6 +223,7 @@
 ### Phase 0: Blockers for Live Deployment (Week 1)
 
 #### P0.1: Fix Settlement Logic
+
 - **Objective**: Correct position settlement based on actual market outcome
 - **Changes**:
   - Add `get_market_resolution(token_id)` to `MarketDiscovery`
@@ -206,6 +235,7 @@
 - **Exit Criteria**: All historical settlements match exchange records
 
 #### P0.2: Chainlink Integration
+
 - **Objective**: Real settlement price source for sniper protection
 - **Changes**:
   - Require `CHAINLINK_CLIENT_ID/SECRET` in live mode
@@ -217,6 +247,7 @@
 - **Exit Criteria**: Sniper alerts fire on historical arbitrage events
 
 #### P0.3: Async Event Bus
+
 - **Objective**: Non-blocking event publishing
 - **Changes**:
   - Replace `publish_sync()` with `await event_bus.publish()`
@@ -227,6 +258,7 @@
 - **Exit Criteria**: No event loop blocking in flame graphs
 
 #### P0.4: Concurrency Safety
+
 - **Objective**: Thread-safe shared state
 - **Changes**:
   - Add `asyncio.Lock()` for `_pending_fills`, `_order_book_cache`, `positions`
@@ -238,6 +270,7 @@
 - **Exit Criteria**: No race condition failures in 10k runs
 
 #### P0.5: Fix Dedup Memory Leak
+
 - **Objective**: Bounded memory for fill deduplication
 - **Changes**:
   - Replace set with `collections.OrderedDict` (LRU cache)
@@ -252,6 +285,7 @@
 ### Phase 1: Reliability Baseline to Reach 8 (Weeks 2-3)
 
 #### P1.1: Order Tick Size Rounding
+
 - **Objective**: Prevent order rejections
 - **Changes**:
   - Add `round_to_tick(price, tick_size=0.01)` utility
@@ -261,6 +295,7 @@
 - **Exit Criteria**: Zero tick-size rejections in paper trading
 
 #### P1.2: Idempotency Keys
+
 - **Objective**: Prevent duplicate orders on retry
 - **Changes**:
   - Generate UUID client_order_id before submission
@@ -271,6 +306,7 @@
 - **Exit Criteria**: Retry test shows no duplicates
 
 #### P1.3: VPIN with Real Trade Flow
+
 - **Objective**: Correct toxicity detection
 - **Changes**:
   - Subscribe to Polymarket trade WebSocket
@@ -281,6 +317,7 @@
 - **Exit Criteria**: VPIN correlates with actual adverse selection events
 
 #### P1.4: Order Book Cache TTL
+
 - **Objective**: Fresh prices for trading decisions
 - **Changes**:
   - Reduce TTL from 60s to 5s
@@ -291,6 +328,7 @@
 - **Exit Criteria**: 95% of trades use <5s old data
 
 #### P1.5: Cancel Verification
+
 - **Objective**: Confirm order cancellation success
 - **Changes**:
   - Query order status after cancel
@@ -301,6 +339,7 @@
 - **Exit Criteria**: No orphaned orders after 1000 cancel cycles
 
 #### P1.6: Per-Token Exposure Limits
+
 - **Objective**: Prevent concentration risk
 - **Changes**:
   - Add `max_per_token_usd: 10.0` to config
@@ -311,6 +350,7 @@
 - **Exit Criteria**: No single token exceeds limit in backtest
 
 #### P1.7: Health Endpoints
+
 - **Objective**: Kubernetes readiness
 - **Changes**:
   - Add `/health` (liveness) and `/ready` (dependencies)
@@ -321,6 +361,7 @@
 - **Exit Criteria**: Probes work in container deployment
 
 #### P1.8: Integration Test Suite
+
 - **Objective**: Automated quality gates
 - **Changes**:
   - Mock CLOB client with recorded responses
@@ -335,6 +376,7 @@
 ### Phase 2: Institutional-Grade Improvements to Reach 9+ (Weeks 4-6)
 
 #### P2.1: LeggedHedge State Machine Rewrite
+
 - **Objective**: Robust multi-leg execution
 - **Changes**:
   - Add leg correlation tracking
@@ -346,6 +388,7 @@
 - **Exit Criteria**: Backtested hedge PnL positive
 
 #### P2.2: Short Arbitrage Implementation
+
 - **Objective**: Capture reverse arb opportunities
 - **Changes**:
   - Check portfolio for existing positions
@@ -356,6 +399,7 @@
 - **Exit Criteria**: Short arb profits in backtest
 
 #### P2.3: Real-Time Mark-to-Market
+
 - **Objective**: Accurate unrealized P&L
 - **Changes**:
   - Add MTM loop to strategy (every iteration)
@@ -367,6 +411,7 @@
 - **Exit Criteria**: Dashboard shows live P&L
 
 #### P2.4: Position Reconciliation
+
 - **Objective**: Sync with exchange state
 - **Changes**:
   - Enhance `Reconciler` to compare position sizes
@@ -377,6 +422,7 @@
 - **Exit Criteria**: Zero drift alerts in 24h live paper
 
 #### P2.5: Deterministic Backtest Framework
+
 - **Objective**: Validate strategies historically
 - **Changes**:
   - Integrate `backtesting/engine.py` with strategies
@@ -388,6 +434,7 @@
 - **Exit Criteria**: Backtest matches paper trading >95%
 
 #### P2.6: Alert Integration
+
 - **Objective**: Real-time incident response
 - **Changes**:
   - Enable Telegram alerts
@@ -416,23 +463,28 @@
 ### Phase 3: Stretch Goals for 10 (Weeks 7-10)
 
 #### P3.1: HSM/Vault for Secrets
+
 - Integrate with AWS Secrets Manager or HashiCorp Vault
 - Rotate credentials automatically
 
 #### P3.2: Multi-Region Failover
+
 - Deploy to 2+ regions
 - Automatic failover on health degradation
 
 #### P3.3: ML Signal Refinement
+
 - Train classifier on historical fills
 - Predict adverse selection probability
 - Adjust sizing dynamically
 
 #### P3.4: Exchange-Native Idempotency
+
 - Partner with Polymarket for proper idempotency key support
 - Eliminate retry duplicate risk at source
 
 #### P3.5: Formal Verification
+
 - Model state machine in TLA+
 - Prove no deadlocks or race conditions
 
@@ -441,23 +493,26 @@
 ## 4. Quantified Target-State Controls
 
 ### Data Freshness
+
 | Metric | Threshold | Action |
-|--------|-----------|--------|
+| :--- | :--- | :--- |
 | Oracle price age | >5s | Block new orders |
 | Order book age | >3s | Refresh before trade |
 | Chainlink divergence | >0.3% | Cancel all orders |
 
 ### Execution SLOs
+
 | Metric | Target | Alert Threshold |
-|--------|--------|-----------------|
+| :--- | :--- | :--- |
 | Order reject rate | <1% | >2% |
 | Fill latency (p99) | <500ms | >1s |
 | Reconciliation drift | 0 | Any drift |
 | Cancel success rate | >99% | <95% |
 
 ### Risk Limits
+
 | Control | Value | Action |
-|---------|-------|--------|
+| :--- | :--- | :--- |
 | Daily loss hard | 5% of capital | Halt + flatten |
 | Max drawdown | 10% | Kill switch |
 | Per-token exposure | $10 | Reject order |
@@ -465,8 +520,9 @@
 | Consecutive losses | 5 | 10-min cooldown |
 
 ### Kill Switch Triggers
+
 | Condition | Response Time |
-|-----------|---------------|
+| :--- | :--- |
 | Manual trigger | Immediate |
 | Drawdown breach | <1s |
 | Exchange disconnect | 30s grace, then halt |
@@ -474,8 +530,9 @@
 | Error rate >10% | 1-min rolling window |
 
 ### Recovery Objectives
+
 | Scenario | RTO | RPO |
-|----------|-----|-----|
+| :--- | :--- | :--- |
 | Bot restart | 30s | Last persisted state |
 | Exchange outage | N/A (wait) | No trades |
 | Oracle failover | 5s | Use stale + flag |
@@ -487,7 +544,7 @@
 ### Test Matrix
 
 | Layer | Type | Coverage Target | Tools |
-|-------|------|-----------------|-------|
+| :--- | :--- | :--- | :--- |
 | Unit | Pure functions | 90% | pytest |
 | Integration | Module interaction | 70% | pytest + mocks |
 | E2E | Full trading loop | 50% | pytest + replay |
@@ -496,6 +553,7 @@
 | Security | SAST/DAST | All secrets | bandit, trivy |
 
 ### Deterministic Backtest/Replay
+
 ```python
 # Replay harness structure
 class ReplayEngine:
@@ -510,17 +568,20 @@ class ReplayEngine:
 ```
 
 ### Integration Test Design
+
 - **Mocked components**: CLOB client, Oracle feed, WebSocket
 - **Recorded fixtures**: Real order books, prices, fills
 - **Assertions**: Signal generation, order lifecycle, P&L
 
 ### Stress/Load Tests
+
 - 1000 markets/second discovery
 - 100 concurrent order submissions
 - 50 WebSocket fills/second
 - Burst: 10x normal rate for 30s
 
 ### Fault Injection Scenarios
+
 1. Oracle returns `None` for 60s
 2. CLOB returns 500 for 10 consecutive calls
 3. WebSocket disconnects mid-fill
@@ -533,6 +594,7 @@ class ReplayEngine:
 10. Concurrent settlement + trade
 
 ### CI/CD Gates
+
 ```yaml
 # Required checks before deploy
 - unit_tests: 90% pass rate
@@ -549,46 +611,59 @@ class ReplayEngine:
 ## 6. Path to 8/9/10 Summary
 
 ### Current State: **5.7/10**
+
 - Core trading logic exists and is reasonably structured
 - Critical bugs in settlement, concurrency, and memory management
 - Insufficient testing and operational tooling
 
 ### Target: **8/10** (Production-Safe)
+
 **Timeline**: 3 weeks (Phase 0 + Phase 1)
+
 **Key Milestones**:
+
 - Week 1: All Phase 0 blockers resolved
 - Week 2: Execution reliability fixes (P1.1-P1.5)
 - Week 3: Risk controls + integration tests (P1.6-P1.8)
 
 **Exit Criteria**:
+
 - Zero critical findings
 - 80% test coverage
 - 24h paper trading with no incidents
 - All SLOs met
 
 ### Target: **9/10** (Institutional-Grade)
+
 **Timeline**: 3 additional weeks (Phase 2)
+
 **Key Changes**:
+
 - Full backtest framework with validation
 - Chaos testing suite
 - Real-time alerting and runbooks
 - Position reconciliation
 
 **Exit Criteria**:
+
 - Backtest accuracy >95%
 - All chaos scenarios pass
 - <1% order reject rate in paper
 - Oncall runbooks documented
 
 ### Target: **10/10** (Best-in-Class)
+
 **Timeline**: 4 additional weeks (Phase 3)
+
 **Key Changes**:
+
 - HSM/vault integration
 - Multi-region deployment
 - ML signal enhancement
 - Formal verification
 
 **Exit Criteria**:
+
 - SOC2 Type II audit ready
 - >99.9% uptime SLA
 - Regulatory compliance (where applicable)
@@ -598,12 +673,14 @@ class ReplayEngine:
 ## Appendix: Quick Reference
 
 ### Critical Files Requiring Immediate Attention
+
 1. `src/strategy/value_betting.py` - Settlement, concurrency, memory
 2. `src/execution/clob_client.py` - Idempotency, tick size, cancel
 3. `src/ingestion/oracle_feed.py` - Chainlink integration
 4. `src/infrastructure/events.py` - Async publishing
 
 ### Recommended Reading Order for New Engineers
+
 1. `ARCHITECTURE.md`
 2. `src/main.py`
 3. `src/strategy/base.py`

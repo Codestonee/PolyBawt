@@ -34,6 +34,7 @@ from src.infrastructure.events import (
     event_bus, EventType, OrderEvent, TradeEvent, RiskEvent, DomainEvent,
 )
 from src.infrastructure.metrics import metrics
+from src.infrastructure.research_recorder import ResearchRecorder
 from src.ingestion.market_discovery import Market, MarketDiscovery
 from src.ingestion.oracle_feed import OracleFeed, SniperRiskLevel
 from src.risk.circuit_breaker import CircuitBreaker
@@ -127,6 +128,9 @@ class EnsembleStrategy:
         self._order_book_ttl_seconds = float(
             getattr(config.trading, "order_book_ttl_seconds", 5.0)
         )
+        self._research: ResearchRecorder | None = None
+        if self.config.observability.research_capture_enabled:
+            self._research = ResearchRecorder(self.config.observability.research_capture_dir)
 
         # Initialize Kelly Sizer for optimal position sizing
         self.kelly_sizer = KellySizer(
@@ -555,11 +559,31 @@ class EnsembleStrategy:
             except Exception as e:
                 logger.warning(f"Failed to fetch order books: {e}")
 
+        # Latency telemetry: spot tick timestamp vs current Polymarket book timestamp.
+        spot_tick = self.oracle.get_cached_price(market.asset)
+        if spot_tick and book_yes:
+            lag_seconds = abs(float(book_yes.timestamp) - float(spot_tick.timestamp))
+            metrics.record_cross_venue_lag(market.asset, lag_seconds)
+
         # Cache order books with timestamp for TTL
         if book_yes:
             self._order_book_cache[market.yes_token_id] = (book_yes, now)
         if book_no and market.no_token_id:
             self._order_book_cache[market.no_token_id] = (book_no, now)
+
+        if self._research:
+            self._research.record_market_snapshot({
+                "asset": market.asset,
+                "condition_id": market.condition_id,
+                "yes_token_id": market.yes_token_id,
+                "no_token_id": market.no_token_id,
+                "spot_price": spot_price,
+                "yes_best_bid": getattr(book_yes, "best_bid", None),
+                "yes_best_ask": getattr(book_yes, "best_ask", None),
+                "no_best_bid": getattr(book_no, "best_bid", None) if book_no else None,
+                "no_best_ask": getattr(book_no, "best_ask", None) if book_no else None,
+                "seconds_to_expiry": market.seconds_to_expiry,
+            })
 
         # === Feed data to VPIN (optional proxy mode) ===
         if (
@@ -618,6 +642,20 @@ class EnsembleStrategy:
                         o['_sniper_size_mult'] = sniper_size_mult
                         o['_asset_exposure_map'] = asset_exposure_map
                         o['_open_positions_assets'] = open_positions_assets
+                        edge_estimate = float(o.get("edge", 0.0))
+                        metrics.record_strategy_edge(strategy.name, market.asset, edge_estimate)
+                        if self._research:
+                            self._research.record_signal({
+                                "strategy": strategy.name,
+                                "asset": market.asset,
+                                "condition_id": market.condition_id,
+                                "token_id": o.get("token_id"),
+                                "side": o.get("side"),
+                                "price": o.get("price"),
+                                "size": o.get("size"),
+                                "edge": edge_estimate,
+                                "reason": o.get("reason", ""),
+                            })
                     all_orders.extend(orders)
             except Exception as e:
                 logger.error(f"Strategy {strategy.name} failed", error=str(e))
@@ -952,6 +990,18 @@ class EnsembleStrategy:
 
                 if order and order.state.is_terminal:
                     self._pending_fills.pop(client_order_id, None)
+
+                if self._research:
+                    self._research.record_fill({
+                        "client_order_id": client_order_id,
+                        "token_id": metadata.token_id,
+                        "condition_id": metadata.condition_id,
+                        "asset": metadata.asset,
+                        "side": metadata.side.value,
+                        "fill_price": fill_price,
+                        "fill_usd": fill_usd,
+                        "strategy": metadata.strategy_name,
+                    })
 
     def stop(self) -> None:
         self._running = False

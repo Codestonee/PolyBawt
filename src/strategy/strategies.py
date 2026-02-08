@@ -10,6 +10,7 @@ from src.strategy.arbitrage_detector import ArbitrageDetector
 from src.execution.clob_client import CLOBClient
 from src.infrastructure.config import AppConfig
 from src.infrastructure.logging import get_logger
+from src.risk.fees import estimated_leg_fee_usd
 
 logger = get_logger(__name__)
 
@@ -32,10 +33,12 @@ class ArbTakerStrategy(BaseStrategy):
     """
     def __init__(self, config: AppConfig):
         super().__init__("ArbTaker", config)
-        self.long_arb_threshold = 0.98  # YES + NO must be < 0.98 for long arb
-        self.short_arb_threshold = 1.02  # YES + NO must be > 1.02 for short arb
-        self.min_profit_pct = 0.005  # 0.5% minimum profit after fees
-        self.max_arb_size = 5.0  # $5 max per leg
+        tuning = config.strategy_tuning.arb_taker
+        self.long_arb_threshold = tuning.long_arb_threshold
+        self.short_arb_threshold = tuning.short_arb_threshold
+        self.min_profit_pct = tuning.min_profit_pct
+        self.max_arb_size = tuning.max_arb_size_usd
+        self.slippage_per_leg_pct = tuning.slippage_per_leg_pct
 
     async def scan(self, context: TradeContext) -> List[dict]:
         if not context.market.no_token_id:
@@ -72,9 +75,10 @@ class ArbTakerStrategy(BaseStrategy):
 
             if total_cost < self.long_arb_threshold:
                 gross_profit = 1.0 - total_cost
-                # Account for fees (2% per trade, 4% total for both legs)
-                fee_pct = 0.04
-                net_profit = gross_profit - (total_cost * fee_pct)
+                # Fee-aware estimate on $1.0 notional per leg + slippage haircut.
+                fee_cost = estimated_leg_fee_usd(yes_ask, 1.0) + estimated_leg_fee_usd(no_ask, 1.0)
+                slippage_cost = self.slippage_per_leg_pct * 2.0
+                net_profit = gross_profit - fee_cost - slippage_cost
 
                 if net_profit > self.min_profit_pct:
                     logger.info(
@@ -114,8 +118,9 @@ class ArbTakerStrategy(BaseStrategy):
 
             if total_proceeds > self.short_arb_threshold:
                 gross_profit = total_proceeds - 1.0
-                fee_pct = 0.04
-                net_profit = gross_profit - (total_proceeds * fee_pct)
+                fee_cost = estimated_leg_fee_usd(yes_bid, 1.0) + estimated_leg_fee_usd(no_bid, 1.0)
+                slippage_cost = self.slippage_per_leg_pct * 2.0
+                net_profit = gross_profit - fee_cost - slippage_cost
 
                 if net_profit > self.min_profit_pct:
                     logger.info(
@@ -180,10 +185,11 @@ class LatencySnipeStrategy(BaseStrategy):
         self.price_history: Dict[str, Deque[tuple[float, float]]] = {}
         # Track last known YES prices to detect lag
         self.last_yes_prices: Dict[str, tuple[float, float]] = {}  # asset -> (price, timestamp)
-        self.window_seconds = 120  # 2 minutes
-        self.min_delta = 0.02      # 2% move in spot
-        self.lag_threshold = 0.01  # YES should move at least 1% if spot moves 2%
-        self.max_position_size = 5.0  # Max $5 per snipe
+        tuning = config.strategy_tuning.latency_snipe
+        self.window_seconds = tuning.window_seconds
+        self.min_delta = tuning.min_spot_delta_pct
+        self.lag_threshold = tuning.lag_threshold_pct
+        self.max_position_size = tuning.max_position_size_usd
 
     async def scan(self, context: TradeContext) -> List[dict]:
         asset = context.market.asset
@@ -316,10 +322,11 @@ class SpreadMakerStrategy(BaseStrategy):
     """
     def __init__(self, config: AppConfig):
         super().__init__("SpreadMaker", config)
-        self.min_spread = 0.05  # 5 cents minimum spread
-        self.quote_offset = 0.01  # 1 cent inside the market
-        self.max_size_per_side = 5.0  # $5 max per side
-        self.order_refresh_time = 15.0  # Don't requote more than every 15s
+        tuning = config.strategy_tuning.spread_maker
+        self.min_spread = tuning.min_spread
+        self.quote_offset = tuning.quote_offset
+        self.max_size_per_side = tuning.max_size_per_side_usd
+        self.order_refresh_time = tuning.order_refresh_time_seconds
 
         # Track inventory for skewing
         self.inventory: Dict[str, float] = {}
@@ -474,6 +481,9 @@ class LeggedHedgeStrategy(BaseStrategy):
     """
     def __init__(self, config: AppConfig):
         super().__init__("LeggedHedge", config)
+        tuning = config.strategy_tuning.legged_hedge
+        self.crash_drop_threshold = tuning.crash_drop_threshold_pct
+        self.default_leg_size_usd = tuning.default_leg_size_usd
         self.active_legs: Dict[str, LegContext] = {} # market_id -> LegContext
 
     async def scan(self, context: TradeContext) -> List[dict]:
@@ -491,13 +501,13 @@ class LeggedHedgeStrategy(BaseStrategy):
                 # for now compare to market price from discovery
                 if context.market.yes_price > 0:
                     drop = (context.market.yes_price - context.order_book.best_bid) / context.market.yes_price
-                    if drop > 0.15:
+                    if drop > self.crash_drop_threshold:
                         logger.warning(f"Crash detected: {context.market.asset} dropped {drop:.2%}")
                         order = {
                             "side": "BUY",
                             "token_id": context.market.yes_token_id,
                             "price": context.order_book.best_bid,
-                            "size": 5.0,
+                            "size": self.default_leg_size_usd,
                             "_leg_context_id": m_id,
                         }
                         leg_ctx.state = LegState.LEG1_Open
@@ -524,7 +534,7 @@ class LeggedHedgeStrategy(BaseStrategy):
             if no_price is None:
                 return []
 
-            hedge_size = leg_ctx.leg1_size if leg_ctx.leg1_size > 0 else 5.0
+            hedge_size = leg_ctx.leg1_size if leg_ctx.leg1_size > 0 else self.default_leg_size_usd
             hedge_price = min(0.99, max(0.01, round(float(no_price), 2)))
             orders = [{
                 "side": "BUY",  # Opposite side

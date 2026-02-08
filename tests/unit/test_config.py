@@ -51,6 +51,12 @@ class TestTradingConfig:
         with pytest.raises(ValueError):
             TradingConfig(inter_market_jitter_ms_min=-1)
 
+    def test_strategy_tuning_and_research_flags_present(self):
+        config = AppConfig()
+        assert config.strategy_tuning.arb_taker.min_profit_pct > 0
+        assert config.strategy_tuning.latency_snipe.window_seconds > 0
+        assert config.observability.research_capture_enabled in (True, False)
+
 
 class TestRiskConfig:
     """Tests for RiskConfig validation."""

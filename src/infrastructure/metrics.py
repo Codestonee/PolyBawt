@@ -185,6 +185,20 @@ ORACLE_AGE = Gauge(
     ["asset"],
 )
 
+CROSS_VENUE_LAG = Histogram(
+    "polymarket_cross_venue_lag_seconds",
+    "Lag between spot tick timestamp and Polymarket book timestamp",
+    ["asset"],
+    buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0],
+)
+
+STRATEGY_EDGE_ESTIMATE = Histogram(
+    "polymarket_strategy_edge_estimate",
+    "Estimated edge for strategy-generated opportunities",
+    ["strategy", "asset"],
+    buckets=[-0.2, -0.1, -0.05, 0.0, 0.02, 0.05, 0.1, 0.2],
+)
+
 # =============================================================================
 # Risk Metrics
 # =============================================================================
@@ -373,6 +387,14 @@ class MetricsCollector:
     def update_oracle_age(self, asset: str, age_seconds: float) -> None:
         """Update oracle age gauge."""
         ORACLE_AGE.labels(asset=asset).set(age_seconds)
+
+    def record_cross_venue_lag(self, asset: str, lag_seconds: float) -> None:
+        """Record lag between spot and order-book timestamps."""
+        CROSS_VENUE_LAG.labels(asset=asset).observe(max(0.0, lag_seconds))
+
+    def record_strategy_edge(self, strategy: str, asset: str, edge: float) -> None:
+        """Record strategy-level edge estimates for calibration analysis."""
+        STRATEGY_EDGE_ESTIMATE.labels(strategy=strategy, asset=asset).observe(edge)
     
     def update_risk(
         self,
