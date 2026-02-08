@@ -41,6 +41,10 @@ class TradingConfig(BaseModel):
     cutoff_seconds: int = 60  # Stop trading before expiry
     min_seconds_after_open: int = 30  # Avoid opening volatility
 
+    # Shadow mode: full code path, no live orders, complete logging
+    shadow_mode: bool = False  # Set True for P1.10 validation phase
+    shadow_mode_log_level: str = "INFO"  # Detailed logging in shadow mode
+
     # Safety: do not let placeholder sentiment inputs affect live sizing.
     # Enable only once real sentiment/funding inputs are wired.
     sentiment_sizing_enabled: bool = False
