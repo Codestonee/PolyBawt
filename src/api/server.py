@@ -135,6 +135,32 @@ async def root():
 @app.get("/health")
 async def health_check():
     state = get_state()
+    
+    # Try to get infrastructure status
+    infrastructure = {}
+    try:
+        from src.infrastructure.circuit_breaker import _global_registry
+        if _global_registry and _global_registry._breakers:
+            infrastructure["circuit_breakers"] = {
+                name: {
+                    "state": b.state.value,
+                    "healthy": not b.is_open,
+                }
+                for name, b in _global_registry._breakers.items()
+            }
+    except ImportError:
+        pass
+    
+    try:
+        from src.infrastructure.kill_switch import _global_kill_switch
+        if _global_kill_switch:
+            infrastructure["kill_switch"] = {
+                "killed": _global_kill_switch.is_killed,
+                "reason": _global_kill_switch.kill_reason.value if _global_kill_switch.kill_reason else None,
+            }
+    except ImportError:
+        pass
+    
     return {
         "status": "online",
         "bot_running": state.is_running,
@@ -142,6 +168,7 @@ async def health_check():
         "active_strategies": state.active_strategies,
         "last_update": state.last_update,
         "event_bus": event_bus.stats,
+        "infrastructure": infrastructure,
     }
 
 
