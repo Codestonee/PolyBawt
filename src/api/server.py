@@ -353,6 +353,39 @@ async def get_orders():
     return api_orders
 
 
+@app.get("/api/dashboard")
+async def get_dashboard():
+    """Get real-time dashboard data for frontend."""
+    try:
+        from src.monitoring.dashboard import get_dashboard_provider
+        provider = get_dashboard_provider()
+        return provider.get_dashboard_data()
+    except ImportError:
+        return {"error": "Dashboard provider not available"}
+
+
+@app.get("/api/monitoring/health")
+async def get_system_health():
+    """Get detailed system health status."""
+    try:
+        from src.monitoring.health_monitor import get_health_monitor
+        monitor = get_health_monitor()
+        return monitor.get_status()
+    except ImportError:
+        return {"error": "Health monitor not available"}
+
+
+@app.get("/api/monitoring/alerts")
+async def get_alert_stats():
+    """Get alerting statistics."""
+    try:
+        from src.monitoring.alerter import get_alerter
+        alerter = get_alerter()
+        return alerter.get_stats()
+    except ImportError:
+        return {"error": "Alerter not available"}
+
+
 # Entry point for running standalone
 if __name__ == "__main__":
     import uvicorn
